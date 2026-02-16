@@ -1,0 +1,1 @@
+source /home/Mega/venv/bin/activate
