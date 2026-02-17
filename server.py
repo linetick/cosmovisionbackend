@@ -54,7 +54,6 @@ print("Подключение к базе знаний...")
 client = chromadb.PersistentClient(path=DB_PATH)
 collection = client.get_collection("satellites")
 
-# === API ===
 app = FastAPI(title="CosmoVision AI Backend", version="2.1")
 
 
@@ -67,7 +66,6 @@ def normalize_query(q: str) -> str:
     """Мини-нормализация: прибираем мусор и частые опечатки."""
     q = (q or "").strip()
     q = re.sub(r"\s+", " ", q)
-    # твой кейс: Метреор -> Метеор
     q = re.sub(r"метреор", "метеор", q, flags=re.IGNORECASE)
     return q
 
@@ -94,12 +92,6 @@ def is_off_topic(query: str) -> bool:
 
 
 def clean_doc_keep_header(text: str) -> str:
-    """
-    ВАЖНО: НЕ убиваем заголовки.
-    - убираем "passage:"
-    - '# Заголовок' превращаем в 'Заголовок.'
-    - выкидываем пустые строки
-    """
     text = (text or "").replace("passage: ", "").strip()
     if not text:
         return ""
@@ -110,7 +102,6 @@ def clean_doc_keep_header(text: str) -> str:
         if not s:
             continue
         if s.startswith("#"):
-            # превращаем '# Метеор-М' -> 'Метеор-М.'
             hdr = s.lstrip("#").strip()
             if hdr:
                 if not hdr.endswith("."):
@@ -123,10 +114,6 @@ def clean_doc_keep_header(text: str) -> str:
 
 
 def retrieve_context(query: str, initial_n: int = 3, max_n: int = 8) -> tuple[str, list[float] | None]:
-    """
-    Достаём контекст так, чтобы он был НЕ пустой и НЕ огрызок.
-    Если первые документы пустые/короткие после чистки — расширяем n_results.
-    """
     q_emb = embedder.encode([f"query: {query}"], normalize_embeddings=True)
 
     n = initial_n
@@ -154,21 +141,17 @@ def retrieve_context(query: str, initial_n: int = 3, max_n: int = 8) -> tuple[st
 
         context = "\n\n".join(cleaned).strip()
 
-        # distances формат обычно [[...]]
         dist_list = None
         if isinstance(distances, list) and distances and isinstance(distances[0], list):
             dist_list = distances[0]
 
-        # запоминаем лучший вариант (самый длинный непустой)
         if context and len(context) > len(best_context):
             best_context = context
             best_distances = dist_list
 
-        # если уже норм — выходим
         if len(context) >= 80:
             return context, dist_list
 
-        # иначе расширяем выборку
         n += 2
 
     return best_context, best_distances
@@ -184,17 +167,13 @@ def looks_answerable(query: str, context: str) -> bool:
     definitional = any(x in q for x in ["что такое", "что значит", "определи", "дать определение"])
 
     if definitional:
-        # Для "что такое спутник Метеор-М" достаточно, чтобы в контексте была строка с "— это"
-        # и упоминание ключевого объекта ("метеор")
         markers = ["— это", "это ", "предназнач", "используется", "служит для", "представляет собой"]
         has_marker = any(m in c for m in markers)
 
-        # если вопрос про Метеор — хотим, чтобы слово встречалось
         if "метеор" in q:
             return has_marker and ("метеор" in c)
         return has_marker
 
-    # не определение: хотя бы какой-то объём
     return len(context) >= 40
 
 
@@ -202,13 +181,11 @@ def extract_definition_from_context(query: str, context: str) -> str | None:
     q = query.lower()
     c = context
 
-    # если вопрос про Метеор — ищем строку "Метеор-М — это ..."
     if "метеор" in q:
         m = re.search(r"(Метеор[-–— ]?М\s*—\s*это[^\n\.]*[\.]?)", c, flags=re.IGNORECASE)
         if m:
             return m.group(1).strip()
 
-    # общий случай: первая строка с "— это"
     m = re.search(r"^(.{0,80}?—\s*это[^\n\.]*[\.]?)", c, flags=re.IGNORECASE | re.MULTILINE)
     if m:
         return m.group(1).strip()
@@ -221,14 +198,12 @@ def is_definitional(q: str) -> bool:
 
 
 def generate_answer_strict(query: str, context: str) -> str:
-    # 1) если можем ответить без LLM — отвечаем без LLM (0 галлюцинаций)
     if is_definitional(query):
         defin = extract_definition_from_context(query, context)
         if defin:
             return defin
         return REFUSAL
 
-    # 2) для не-определений — LLM, но БЕЗ FACT/ANSWER формата
     if not context.strip():
         return REFUSAL
 
@@ -258,7 +233,6 @@ def generate_answer_strict(query: str, context: str) -> str:
     input_len = inputs.input_ids.shape[1]
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
 
-    # если модель несёт что-то совсем левое — хотя бы отрежем и подстрахуем
     if not text or len(text) < 3:
         return REFUSAL
     return text

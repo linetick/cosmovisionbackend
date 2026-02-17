@@ -62,7 +62,6 @@ def build_chunks(title: str, body: str) -> List[str]:
 
     header = f"{title}\n" if title else ""
 
-    # 1) Если первый абзац похож на определение — делаем его отдельным чанком
     chunks: List[str] = []
     start_idx = 0
     if has_definition_marker(paras[0]):
@@ -70,7 +69,6 @@ def build_chunks(title: str, body: str) -> List[str]:
         chunks.append(first)
         start_idx = 1
 
-    # 2) Остальное склеиваем как раньше
     buf = ""
 
     def push_buf():
@@ -98,7 +96,6 @@ def build_chunks(title: str, body: str) -> List[str]:
     if buf:
         push_buf()
 
-    # 3) Склейка слишком коротких чанков к предыдущему
     merged: List[str] = []
     for ch in chunks:
         if merged and len(ch) < MIN_CHUNK_CHARS:
