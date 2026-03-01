@@ -7,6 +7,7 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "knowledge_db")
@@ -257,8 +258,10 @@ def handle_query(req: QueryRequest):
                 ),
                 "context_used": False,
             }
-
+        
+        t0 = time.time()
         context, distances = retrieve_context(q, initial_n=3, max_n=9)
+        t1 = time.time()
 
         # Мягкий отсев по distance (если есть). Порог пусть будет консервативный.
         if distances is not None and len(distances) > 0:
@@ -267,6 +270,8 @@ def handle_query(req: QueryRequest):
                 return {"query": q, "answer": REFUSAL, "context_used": False}
 
         answer = generate_answer_strict(q, context)
+        t2 = time.time()
+        print(f"[timing] retrieve={t1-t0:.3f}s | generate={t2-t1:.3f}s | total={t2-t0:.3f}s")
 
         return {
             "query": q,
