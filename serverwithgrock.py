@@ -31,7 +31,7 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 REFUSAL = "В предоставленных данных нет информации."
 
 # === Device ===
-device = "cpu"
+#device = "cpu"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Используемое устройство: {device}")
 if device == "cuda":
@@ -39,7 +39,8 @@ if device == "cuda":
 
 # === Models ===
 print("Загрузка модели эмбеддингов...")
-embedder = SentenceTransformer("intfloat/multilingual-e5-small", device="cuda")
+#embedder = SentenceTransformer("intfloat/multilingual-e5-small", device="cuda")
+embedder = SentenceTransformer("intfloat/multilingual-e5-small", device=device)
 
 print("Загрузка LLM (Phi-3-mini)...")
 tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3-mini-4k-instruct")
@@ -47,7 +48,8 @@ tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3-mini-4k-instruct")
 if device == "cuda":
     model = AutoModelForCausalLM.from_pretrained(
         "microsoft/Phi-3-mini-4k-instruct",
-        device_map="auto",
+        #device_map="auto",
+        device_map={"":0},
         trust_remote_code=True,
         torch_dtype=torch.float16,
     )
@@ -166,21 +168,17 @@ def retrieve_context(query: str, initial_n: int = 3, max_n: int = 8) -> tuple[st
 
         context = "\n\n".join(cleaned).strip()
 
-        # distances формат обычно [[...]]
         dist_list = None
         if isinstance(distances, list) and distances and isinstance(distances[0], list):
             dist_list = distances[0]
 
-        # запоминаем лучший вариант (самый длинный непустой)
         if context and len(context) > len(best_context):
             best_context = context
             best_distances = dist_list
 
-        # если уже норм — выходим
         if len(context) >= 80:
             return context, dist_list
 
-        # иначе расширяем выборку
         n += 2
 
     return best_context, best_distances
@@ -196,12 +194,9 @@ def looks_answerable(query: str, context: str) -> bool:
     definitional = any(x in q for x in ["что такое", "что значит", "определи", "дать определение"])
 
     if definitional:
-        # Для "что такое спутник Метеор-М" достаточно, чтобы в контексте была строка с "— это"
-        # и упоминание ключевого объекта ("метеор")
         markers = ["— это", "это ", "предназнач", "используется", "служит для", "представляет собой"]
         has_marker = any(m in c for m in markers)
 
-        # если вопрос про Метеор — хотим, чтобы слово встречалось
         if "метеор" in q:
             return has_marker and ("метеор" in c)
         return has_marker
@@ -261,7 +256,8 @@ def generate_answer_strict(query: str, context: str) -> str:
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=120,
+            #max_new_tokens=120,
+            max_new_tokens=60,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
@@ -397,14 +393,11 @@ try:
     print(f"🔗 Debug: {NGROK_URL}/debug/kb")
     print("="*60)
     
-    # ГЛАВНОЕ ИСПРАВЛЕНИЕ: Не даем скрипту завершиться
     print("Ожидание подключений (не закрывайте эту ячейку)...\n")
     while True:
         time.sleep(1)
         
 except Exception as e:
     print(f"Ошибка ngrok: {e}")
-    # Если ngrok упадет, все равно держим процесс живым, чтобы Colab не убил ячейку
     while True:
         time.sleep(1)
-

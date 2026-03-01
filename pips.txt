@@ -1,0 +1,7 @@
+!pip install transformers==4.40.2
+!pip install sentence-transformers==2.6.1
+!pip install accelerate==0.30.1
+!pip install chromadb
+!pip install fastapi uvicorn
+!pip install torch
+!pip install pyngrok
