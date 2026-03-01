@@ -6,3 +6,5 @@ fastapi
 uvicorn
 torch
 pyngrok
+faster-whisper
+ffmpeg-python

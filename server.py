@@ -1,5 +1,7 @@
 # server.py
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
+import tempfile
+from faster_whisper import WhisperModel
 from pydantic import BaseModel
 import os
 import re
@@ -48,6 +50,11 @@ else:
     ).to("cpu")
 
 model.eval()
+
+print("Загрузка Whisper (faster-whisper)...")
+whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
+whisper_compute = "float16" if whisper_device == "cuda" else "int8"
+whisper_model = WhisperModel("small", device=whisper_device, compute_type=whisper_compute)
 
 # === Chroma ===
 print("Подключение к базе знаний...")
@@ -238,6 +245,22 @@ def generate_answer_strict(query: str, context: str) -> str:
         return REFUSAL
     return text
 
+def transcribe_audio_bytes(data: bytes, language: str = "ru") -> str:
+    # faster-whisper удобнее скармливать файлом
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+        tmp.write(data)
+        tmp.flush()
+
+        segments, info = whisper_model.transcribe(
+            tmp.name,
+            language=language,   # "ru" или None (авто)
+            vad_filter=True,     # ускоряет на паузах
+            beam_size=5
+        )
+
+        text = " ".join(seg.text for seg in segments).strip()
+        return text
+
 
 # ---------- Endpoint ----------
 @app.post("/query")
@@ -282,6 +305,67 @@ def handle_query(req: QueryRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
 
+@app.post("/query_audio")
+async def handle_query_audio(file: UploadFile = File(...)):
+    try:
+        audio_bytes = await file.read()
+        if not audio_bytes:
+            return {"answer": REFUSAL, "context_used": False, "transcript": ""}
+
+        t0 = time.time()
+        transcript = transcribe_audio_bytes(audio_bytes, language="ru")
+        t1 = time.time()
+
+        q = normalize_query(transcript)
+
+        if not q:
+            return {"answer": REFUSAL, "context_used": False, "transcript": transcript}
+
+        if is_off_topic(q):
+            return {
+                "transcript": transcript,
+                "query": q,
+                "answer": (
+                    "Я отвечаю только по космонавтике из базы знаний. "
+                    "Спроси, например: «Как устроены солнечные панели на Метеоре-М?»"
+                ),
+                "context_used": False,
+                "timing": {"asr": round(t1 - t0, 3)}
+            }
+
+        t2 = time.time()
+        context, distances = retrieve_context(q, initial_n=3, max_n=9)
+        t3 = time.time()
+
+        if distances is not None and len(distances) > 0:
+            best = distances[0]
+            if best is not None and best > 0.9:
+                return {
+                    "transcript": transcript,
+                    "query": q,
+                    "answer": REFUSAL,
+                    "context_used": False,
+                    "timing": {"asr": round(t1 - t0, 3), "retrieve": round(t3 - t2, 3)}
+                }
+
+        answer = generate_answer_strict(q, context)
+        t4 = time.time()
+
+        return {
+            "transcript": transcript,
+            "query": q,
+            "answer": answer,
+            "context_used": (answer != REFUSAL),
+            "timing": {
+                "asr": round(t1 - t0, 3),
+                "retrieve": round(t3 - t2, 3),
+                "generate": round(t4 - t3, 3),
+                "total": round(t4 - t0, 3),
+            },
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка обработки аудио: {str(e)}")
 
 @app.get("/debug/kb")
 def debug_kb():
