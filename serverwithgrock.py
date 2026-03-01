@@ -1,6 +1,6 @@
 # server.py
 from fastapi import FastAPI, HTTPException, UploadFile, File
-import tempfile
+import tempfile, subprocess
 from faster_whisper import WhisperModel
 from pydantic import BaseModel
 import os
@@ -278,21 +278,44 @@ def generate_answer_strict(query: str, context: str) -> str:
         return REFUSAL
     return text
 
-def transcribe_audio_bytes(data: bytes, language: str = "ru") -> str:
-    # faster-whisper удобнее скармливать файлом
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-        tmp.write(data)
-        tmp.flush()
+import tempfile, subprocess, os
 
+def wav_to_16k_mono_wav_bytes(wav_bytes: bytes) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fin:
+        fin.write(wav_bytes)
+        fin.flush()
+        in_path = fin.name
+
+    out_fd, out_path = tempfile.mkstemp(suffix=".wav")
+    os.close(out_fd)
+
+    try:
+        # -ac 1: mono, -ar 16000: 16kHz, -f wav: wav container
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", in_path, "-ac", "1", "-ar", "16000", "-f", "wav", out_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        with open(out_path, "rb") as f:
+            return f.read()
+    finally:
+        for p in (in_path, out_path):
+            try: os.remove(p)
+            except: pass
+
+def transcribe_audio_bytes(data: bytes, language: str = "ru") -> str:
+    data = wav_to_16k_mono_wav_bytes(data)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+        tmp.write(data); tmp.flush()
         segments, info = whisper_model.transcribe(
             tmp.name,
-            language=language,   # "ru" или None (авто)
-            vad_filter=True,     # ускоряет на паузах
-            beam_size=5
+            language=language,
+            vad_filter=True,
+            beam_size=5,
         )
-
-        text = " ".join(seg.text for seg in segments).strip()
-        return text
+        return " ".join(seg.text for seg in segments).strip()
 
 
 # ---------- Endpoint ----------
