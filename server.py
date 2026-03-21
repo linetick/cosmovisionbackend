@@ -20,6 +20,24 @@ print("SERVER CWD =", os.getcwd())
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 REFUSAL = "В предоставленных данных нет информации."
+QUERY_STOPWORDS = {
+    "а", "без", "был", "была", "были", "было", "быть", "в", "во", "вопрос", "все",
+    "где", "для", "до", "его", "ее", "если", "есть", "еще", "же", "за", "и", "из",
+    "или", "как", "какая", "какие", "какой", "каком", "какому", "какую", "когда",
+    "кто", "ли", "м", "меня", "мне", "на", "над", "надо", "не", "нет", "но", "о",
+    "об", "обо", "он", "она", "они", "оно", "от", "по", "под", "при", "про", "с",
+    "со", "так", "такое", "такой", "там", "то", "только", "у", "что", "это", "этот",
+    "эта", "эти", "энергия"
+}
+WEAK_QUERY_TOKENS = {
+    "аппарат", "баз", "дан", "знан", "информац", "космонавтик", "космос", "метеор",
+    "модел", "ответ", "спутник", "систем"
+}
+REFUSAL_PATTERNS = [
+    "нет информации", "информация отсутствует", "не найден", "не найдена",
+    "не найдено", "не указ", "не опис", "не содерж", "не сказан", "не сообщ",
+    "не упомина", "не удалось найти", "нет данных", "отсутствуют данные",
+]
 
 # === Device ===
 device = "cpu"
@@ -119,6 +137,125 @@ def clean_doc_keep_header(text: str) -> str:
         out.append(s)
 
     return "\n".join(out).strip()
+
+
+def normalize_match_token(token: str) -> str:
+    token = token.lower().replace("ё", "е").strip("-")
+    if not token:
+        return ""
+
+    suffixes = (
+        "иями", "ями", "ами", "иях", "ев", "ов", "ие", "ые", "ое", "ее",
+        "ий", "ый", "ой", "ая", "яя", "ам", "ям", "ах", "ях", "ом", "ем", "ую",
+        "юю", "ого", "ему", "ому", "ыми", "ими", "ия", "ья", "ье", "иям", "ием",
+        "ию", "ью", "а", "я", "ы", "и", "е", "у", "ю", "о"
+    )
+    for suffix in suffixes:
+        if len(token) > len(suffix) + 2 and token.endswith(suffix):
+            token = token[:-len(suffix)]
+            break
+    return token
+
+
+def tokenize_for_match(text: str) -> list[str]:
+    raw_tokens = re.findall(r"[0-9a-zA-Zа-яА-ЯёЁ-]+", (text or "").lower().replace("ё", "е"))
+    tokens: list[str] = []
+    for raw in raw_tokens:
+        parts = [p for p in raw.split("-") if p]
+        for part in parts:
+            norm = normalize_match_token(part)
+            if len(norm) >= 2:
+                tokens.append(norm)
+    return tokens
+
+
+def query_token_sets(query: str) -> tuple[set[str], set[str]]:
+    query_tokens = {
+        tok for tok in tokenize_for_match(query)
+        if tok not in QUERY_STOPWORDS
+    }
+    strong_tokens = {tok for tok in query_tokens if tok not in WEAK_QUERY_TOKENS}
+    return query_tokens, strong_tokens
+
+
+def split_doc_candidates(doc: str) -> list[str]:
+    lines = [line.strip() for line in (doc or "").splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    candidates: list[str] = []
+    if len(lines) >= 2 and len(lines[0]) <= 40 and not re.search(r"[.!?]$", lines[0]):
+        candidates.append(f"{lines[0]}. {' '.join(lines[1:])}".strip())
+
+    candidates.extend(lines)
+
+    merged_text = " ".join(lines)
+    candidates.extend(
+        chunk.strip()
+        for chunk in re.split(r"(?<=[.!?])\s+", merged_text)
+        if chunk.strip()
+    )
+    candidates.append(merged_text)
+
+    deduped: list[str] = []
+    seen = set()
+    for candidate in candidates:
+        key = re.sub(r"\s+", " ", candidate).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(key)
+    return deduped
+
+
+def find_extractive_answer(query: str, hits: list[dict]) -> str | None:
+    query_tokens, strong_tokens = query_token_sets(query)
+    if not query_tokens:
+        return None
+
+    best_text = None
+    best_score = -1
+    best_strong_overlap = 0
+    best_total_overlap = 0
+
+    for hit in hits:
+        doc = (hit.get("doc") or "").strip()
+        meta = hit.get("meta") or {}
+        section = meta.get("section") or ""
+        section_tokens = set(tokenize_for_match(section))
+
+        for candidate in split_doc_candidates(doc):
+            candidate_tokens = set(tokenize_for_match(candidate))
+            if not candidate_tokens:
+                continue
+
+            total_overlap = len(query_tokens & candidate_tokens)
+            strong_overlap = len(strong_tokens & candidate_tokens)
+            score = strong_overlap * 5 + total_overlap
+            if strong_tokens and section_tokens:
+                score += len(strong_tokens & section_tokens) * 3
+
+            if score > best_score:
+                best_text = candidate
+                best_score = score
+                best_strong_overlap = strong_overlap
+                best_total_overlap = total_overlap
+
+    if not best_text:
+        return None
+    if strong_tokens and best_strong_overlap == 0:
+        return None
+    if best_total_overlap == 0:
+        return None
+
+    return best_text
+
+
+def is_refusal_like(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    if not normalized:
+        return True
+    return any(pattern in normalized for pattern in REFUSAL_PATTERNS)
 
 
 def retrieve_hits(query: str, initial_n: int = 3, max_n: int = 8) -> list[dict]:
@@ -232,11 +369,15 @@ def is_definitional(q: str) -> bool:
     return any(x in ql for x in ["что такое", "что значит", "определи", "дать определение"])
 
 
-def generate_answer_strict(query: str, context: str) -> str:
+def generate_answer_strict(query: str, context: str, hits: list[dict] | None = None) -> str:
     if is_definitional(query):
         defin = extract_definition_from_context(query, context)
         if defin:
             return defin
+
+    extractive = find_extractive_answer(query, hits or [])
+    if extractive:
+        return extractive
 
     if not context.strip():
         return REFUSAL
@@ -271,6 +412,8 @@ def generate_answer_strict(query: str, context: str) -> str:
     text = re.sub(r"^ответ:\s*", "", text, flags=re.IGNORECASE)
 
     if not text or len(text) < 3:
+        return REFUSAL
+    if is_refusal_like(text):
         return REFUSAL
     return text
 
@@ -318,7 +461,7 @@ def handle_query(req: QueryRequest):
         if not context:
             return {"query": q, "answer": REFUSAL, "context_used": False}
 
-        answer = generate_answer_strict(q, context)
+        answer = generate_answer_strict(q, context, hits)
         t2 = time.time()
         print(f"[timing] retrieve={t1-t0:.3f}s | generate={t2-t1:.3f}s | total={t2-t0:.3f}s")
 
@@ -372,7 +515,7 @@ async def handle_query_audio(file: UploadFile = File(...)):
                 "timing": {"asr": round(t1 - t0, 3), "retrieve": round(t3 - t2, 3)}
             }
 
-        answer = generate_answer_strict(q, context)
+        answer = generate_answer_strict(q, context, hits)
         t4 = time.time()
 
         return {
@@ -404,6 +547,7 @@ def debug_search(req: QueryRequest):
     q = normalize_query(req.text)
     hits = retrieve_hits(q, initial_n=5, max_n=8)
     context = build_context_from_hits(hits)
+    extractive = find_extractive_answer(q, hits)
 
     top = []
     for i, hit in enumerate(hits):
@@ -422,6 +566,7 @@ def debug_search(req: QueryRequest):
         "retrieved_docs": len(hits),
         "context_chars": len(context),
         "context": context,
+        "extractive_answer": extractive,
         "top": top,
     }
 
