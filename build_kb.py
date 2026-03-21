@@ -6,8 +6,9 @@ from typing import List, Tuple
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-RAW_DIR = "knowledge_raw/*.md"
-DB_PATH = "knowledge_db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RAW_DIR = os.path.join(BASE_DIR, "knowledge_raw", "*.md")
+DB_PATH = os.path.join(BASE_DIR, "knowledge_db")
 COLLECTION = "satellites"
 
 MIN_CHUNK_CHARS = 120
@@ -111,7 +112,7 @@ docs_clean: List[str] = []
 metadatas = []
 ids = []
 
-for file_path in glob.glob(RAW_DIR):
+for file_path in sorted(glob.glob(RAW_DIR)):
     with open(file_path, "r", encoding="utf-8") as f:
         content = f.read()
 
@@ -134,7 +135,11 @@ for file_path in glob.glob(RAW_DIR):
             ids.append(f"{source}_{chunk_idx}")
             chunk_idx += 1
 
+if not docs_clean:
+    raise RuntimeError(f"Не найдено ни одного фрагмента для индексации. Проверь папку: {RAW_DIR}")
+
 print("Создание векторной базы...")
+os.makedirs(DB_PATH, exist_ok=True)
 client = chromadb.PersistentClient(path=DB_PATH)
 
 try:

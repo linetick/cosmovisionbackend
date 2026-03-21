@@ -55,8 +55,8 @@ whisper_model = WhisperModel("small", device=whisper_device, compute_type=whispe
 if device == "cuda":
     model = AutoModelForCausalLM.from_pretrained(
         "microsoft/Phi-3-mini-4k-instruct",
-        #device_map="auto",
-        device_map={"":0},
+        device_map="auto",
+        #device_map={"":0},
         trust_remote_code=True,
         torch_dtype=torch.float16,
     )
@@ -143,52 +143,76 @@ def clean_doc_keep_header(text: str) -> str:
     return "\n".join(out).strip()
 
 
-def retrieve_context(query: str, initial_n: int = 3, max_n: int = 8) -> tuple[str, list[float] | None]:
-    """
-    Достаём контекст так, чтобы он был НЕ пустой и НЕ огрызок.
-    Если первые документы пустые/короткие после чистки — расширяем n_results.
-    """
+def retrieve_hits(query: str, initial_n: int = 3, max_n: int = 8) -> list[dict]:
+    """Достаём top-k чанки из Chroma и сохраняем distance/metadata для дебага."""
+    total_docs = collection.count()
+    if total_docs <= 0:
+        return []
+
     q_emb = embedder.encode([f"query: {query}"], normalize_embeddings=True)
 
-    n = initial_n
-    best_distances = None
-    best_context = ""
+    n = min(max(initial_n, 1), total_docs)
+    limit = min(max_n, total_docs)
+    best_hits: list[dict] = []
+    best_chars = 0
 
-    while n <= max_n:
+    while True:
         try:
             results = collection.query(
                 query_embeddings=q_emb,
                 n_results=n,
-                include=["documents", "distances"],
+                include=["documents", "distances", "metadatas"],
             )
-            distances = results.get("distances", None)
         except TypeError:
             results = collection.query(query_embeddings=q_emb, n_results=n)
-            distances = None
 
         docs = (results.get("documents") or [[]])[0]
-        cleaned = []
-        for d in docs:
+        distances = (results.get("distances") or [[]])[0]
+        metadatas = (results.get("metadatas") or [[]])[0]
+
+        hits: list[dict] = []
+        seen_docs = set()
+        for i, d in enumerate(docs):
             cd = clean_doc_keep_header(d)
-            if cd:
-                cleaned.append(cd)
+            if not cd or cd in seen_docs:
+                continue
+            seen_docs.add(cd)
+            hits.append({
+                "doc": cd,
+                "distance": distances[i] if i < len(distances) else None,
+                "meta": metadatas[i] if i < len(metadatas) else None,
+            })
 
-        context = "\n\n".join(cleaned).strip()
+        context_chars = sum(len(hit["doc"]) for hit in hits)
+        if context_chars > best_chars:
+            best_hits = hits
+            best_chars = context_chars
 
-        dist_list = None
-        if isinstance(distances, list) and distances and isinstance(distances[0], list):
-            dist_list = distances[0]
+        if context_chars >= 80 or n >= limit:
+            return best_hits
 
-        if context and len(context) > len(best_context):
-            best_context = context
-            best_distances = dist_list
+        n = min(n + 2, limit)
 
-        if len(context) >= 80:
-            return context, dist_list
 
-        n += 2
+def build_context_from_hits(hits: list[dict], max_chars: int = 1800) -> str:
+    parts = []
+    total = 0
 
-    return best_context, best_distances
+    for hit in hits:
+        doc = (hit.get("doc") or "").strip()
+        if not doc:
+            continue
+        if parts and total + len(doc) + 2 > max_chars:
+            break
+        parts.append(doc)
+        total += len(doc) + 2
+
+    return "\n\n".join(parts).strip()
+
+
+def retrieve_context(query: str, initial_n: int = 3, max_n: int = 8) -> tuple[str, list[dict]]:
+    hits = retrieve_hits(query, initial_n=initial_n, max_n=max_n)
+    return build_context_from_hits(hits), hits
 
 
 def looks_answerable(query: str, context: str) -> bool:
@@ -240,15 +264,15 @@ def generate_answer_strict(query: str, context: str) -> str:
         defin = extract_definition_from_context(query, context)
         if defin:
             return defin
-        return REFUSAL
 
     # 2) для не-определений — LLM, но БЕЗ FACT/ANSWER формата
     if not context.strip():
         return REFUSAL
 
     system = (
-        "Ты — ИИ-ассистент по космонавтике.\n"
-        "Отвечай только по контексту. Нельзя добавлять факты не из контекста.\n"
+        "Ты — ИИ-ассистент по космонавтике с RAG.\n"
+        "Отвечай только по фрагментам базы знаний из блока КОНТЕКСТ.\n"
+        "Нельзя добавлять факты не из контекста.\n"
         f"Если в контексте нет ответа, верни ровно: {REFUSAL}"
     )
 
@@ -263,8 +287,7 @@ def generate_answer_strict(query: str, context: str) -> str:
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            #max_new_tokens=120,
-            max_new_tokens=60,
+            max_new_tokens=120,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
@@ -272,6 +295,8 @@ def generate_answer_strict(query: str, context: str) -> str:
 
     input_len = inputs.input_ids.shape[1]
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^ответ:\s*", "", text, flags=re.IGNORECASE)
 
     # если модель несёт что-то совсем левое — хотя бы отрежем и подстрахуем
     if not text or len(text) < 3:
@@ -338,13 +363,9 @@ def handle_query(req: QueryRequest):
                 "context_used": False,
             }
 
-        context, distances = retrieve_context(q, initial_n=3, max_n=9)
-
-        # Мягкий отсев по distance (если есть). Порог пусть будет консервативный.
-        if distances is not None and len(distances) > 0:
-            best = distances[0]
-            if best is not None and best > 0.9:
-                return {"query": q, "answer": REFUSAL, "context_used": False}
+        context, hits = retrieve_context(q, initial_n=3, max_n=9)
+        if not context:
+            return {"query": q, "answer": REFUSAL, "context_used": False}
 
         answer = generate_answer_strict(q, context)
 
@@ -386,19 +407,17 @@ async def handle_query_audio(file: UploadFile = File(...)):
             }
 
         t2 = time.time()
-        context, distances = retrieve_context(q, initial_n=3, max_n=9)
+        context, hits = retrieve_context(q, initial_n=3, max_n=9)
         t3 = time.time()
 
-        if distances is not None and len(distances) > 0:
-            best = distances[0]
-            if best is not None and best > 0.9:
-                return {
-                    "transcript": transcript,
-                    "query": q,
-                    "answer": REFUSAL,
-                    "context_used": False,
-                    "timing": {"asr": round(t1 - t0, 3), "retrieve": round(t3 - t2, 3)}
-                }
+        if not context:
+            return {
+                "transcript": transcript,
+                "query": q,
+                "answer": REFUSAL,
+                "context_used": False,
+                "timing": {"asr": round(t1 - t0, 3), "retrieve": round(t3 - t2, 3)}
+            }
 
         answer = generate_answer_strict(q, context)
         t4 = time.time()
@@ -432,31 +451,16 @@ def debug_kb():
 @app.post("/debug/search")
 def debug_search(req: QueryRequest):
     q = normalize_query(req.text)
-
-    q_emb = embedder.encode([f"query: {q}"], normalize_embeddings=True)
-
-    try:
-        res = collection.query(
-            query_embeddings=q_emb,
-            n_results=5,
-            include=["documents", "distances", "metadatas"],
-        )
-    except TypeError:
-        res = collection.query(query_embeddings=q_emb, n_results=5)
-
-    docs = (res.get("documents") or [[]])[0]
-    dists = (res.get("distances") or [[]])[0]
-    metas = (res.get("metadatas") or [[]])[0]
-
-    n = max(len(docs), len(dists), len(metas))
+    hits = retrieve_hits(q, initial_n=5, max_n=8)
+    context = build_context_from_hits(hits)
 
     top = []
-    for i in range(n):
+    for i, hit in enumerate(hits):
         top.append({
             "i": i,
-            "distance": dists[i] if i < len(dists) else None,
-            "meta": metas[i] if i < len(metas) else None,
-            "doc": docs[i] if i < len(docs) else None,
+            "distance": hit.get("distance"),
+            "meta": hit.get("meta"),
+            "doc": hit.get("doc"),
         })
 
     return {
@@ -464,7 +468,9 @@ def debug_search(req: QueryRequest):
         "server_cwd": os.getcwd(),
         "db_path": DB_PATH if "DB_PATH" in globals() else "unknown",
         "collection_count": collection.count(),
-        "lens": {"docs": len(docs), "dists": len(dists), "metas": len(metas)},
+        "retrieved_docs": len(hits),
+        "context_chars": len(context),
+        "context": context,
         "top": top,
     }
 
