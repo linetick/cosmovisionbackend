@@ -8,7 +8,7 @@ import re
 import chromadb
 from sentence_transformers import SentenceTransformer
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 from pyngrok import conf, ngrok
 
@@ -31,6 +31,11 @@ print("SERVER CWD =", os.getcwd())
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 REFUSAL = "В предоставленных данных нет информации."
+MODEL_ID = os.getenv("LLM_MODEL_ID", "meta-llama/Llama-3.2-3B-Instruct").strip()
+HF_TOKEN = (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or "").strip() or None
+LLM_USE_4BIT = os.getenv("LLM_USE_4BIT", "1").strip().lower() not in {"0", "false", "no"}
+LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "80"))
+LLM_MAX_INPUT_TOKENS = int(os.getenv("LLM_MAX_INPUT_TOKENS", "3072"))
 QUERY_STOPWORDS = {
     "а", "без", "был", "была", "были", "было", "быть", "в", "во", "вопрос", "все",
     "где", "для", "до", "его", "ее", "если", "есть", "еще", "же", "за", "и", "из",
@@ -65,28 +70,48 @@ if device == "cuda":
 print("Загрузка модели эмбеддингов...")
 embedder = SentenceTransformer("intfloat/multilingual-e5-small", device=embedder_device)
 
-print("Загрузка LLM (Phi-3-mini)...")
-tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3-mini-4k-instruct")
+print(f"Загрузка LLM ({MODEL_ID})...")
+if not HF_TOKEN:
+    print("HF_TOKEN не задан. Загрузка с Hugging Face сработает только при локальном кеше или активном huggingface-cli login.")
+
+tokenizer_kwargs = {}
+if HF_TOKEN:
+    tokenizer_kwargs["token"] = HF_TOKEN
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, **tokenizer_kwargs)
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token = tokenizer.eos_token
 
 print("Загрузка Whisper (faster-whisper)...")
 whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
 whisper_compute = "float16" if whisper_device == "cuda" else "int8"
 whisper_model = WhisperModel("small", device=whisper_device, compute_type=whisper_compute)
 
+model_kwargs = {
+    "trust_remote_code": True,
+}
+if HF_TOKEN:
+    model_kwargs["token"] = HF_TOKEN
+
 if device == "cuda":
-    model = AutoModelForCausalLM.from_pretrained(
-        "microsoft/Phi-3-mini-4k-instruct",
-        device_map="auto",
-        #device_map={"":0},
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-    )
+    model_kwargs["device_map"] = "auto"
+    model_kwargs["torch_dtype"] = torch.float16
+    if LLM_USE_4BIT:
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+        print("LLM загружается в 4-bit (NF4).")
+    else:
+        print("LLM загружается без 4-bit квантования.")
 else:
-    model = AutoModelForCausalLM.from_pretrained(
-        "microsoft/Phi-3-mini-4k-instruct",
-        trust_remote_code=True,
-        torch_dtype=torch.float32,
-    ).to("cpu")
+    model_kwargs["torch_dtype"] = torch.float32
+    print("CUDA недоступна, 4-bit квантование отключено.")
+
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
+if device != "cuda":
+    model = model.to("cpu")
 
 model.eval()
 
@@ -452,13 +477,19 @@ def generate_answer_strict(query: str, context: str, hits: list[dict] | None = N
     ]
 
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=3800).to(device)
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=LLM_MAX_INPUT_TOKENS,
+    ).to(device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=120,
+            max_new_tokens=LLM_MAX_NEW_TOKENS,
             do_sample=False,
+            use_cache=True,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )

@@ -1,6 +1,8 @@
-!pip install transformers==4.40.2
+!pip install transformers==4.45.2
 !pip install sentence-transformers==2.6.1
 !pip install accelerate==0.30.1
+!pip install bitsandbytes==0.43.3
+!pip install tiktoken>=0.7.0
 !pip install chromadb
 !pip install fastapi uvicorn
 !pip install torch
