@@ -96,21 +96,30 @@ if HF_TOKEN:
 if device == "cuda":
     model_kwargs["device_map"] = "auto"
     model_kwargs["torch_dtype"] = torch.float16
-    if LLM_USE_4BIT:
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.float16,
-        )
-        print("LLM загружается в 4-bit (NF4).")
-    else:
-        print("LLM загружается без 4-bit квантования.")
 else:
     model_kwargs["torch_dtype"] = torch.float32
     print("CUDA недоступна, 4-bit квантование отключено.")
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
+if device == "cuda" and LLM_USE_4BIT:
+    quantized_model_kwargs = dict(model_kwargs)
+    quantized_model_kwargs["quantization_config"] = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16,
+    )
+    try:
+        print("LLM загружается в 4-bit (NF4).")
+        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **quantized_model_kwargs)
+    except Exception as exc:
+        print(f"⚠️ Не удалось загрузить LLM в 4-bit: {exc}")
+        print("⚠️ Переключаемся на обычную загрузку модели без квантования. Если это Colab, причина обычно в несовместимости bitsandbytes/triton.")
+        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
+else:
+    if device == "cuda":
+        print("LLM загружается без 4-bit квантования.")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
+
 if device != "cuda":
     model = model.to("cpu")
 
