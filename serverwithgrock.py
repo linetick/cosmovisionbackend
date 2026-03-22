@@ -31,7 +31,7 @@ print("SERVER CWD =", os.getcwd())
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 REFUSAL = "В предоставленных данных нет информации."
-MODEL_ID = os.getenv("LLM_MODEL_ID", "Qwen/Qwen2.5-1.5B-Instruct").strip()
+MODEL_ID = os.getenv("LLM_MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct").strip()
 HF_TOKEN = (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or "").strip() or None
 LLM_USE_4BIT = os.getenv("LLM_USE_4BIT", "1").strip().lower() not in {"0", "false", "no"}
 LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "64"))
