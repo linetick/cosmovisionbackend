@@ -3,6 +3,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 import tempfile
 from faster_whisper import WhisperModel
 from pydantic import BaseModel
+import json
 import os
 import re
 import chromadb
@@ -11,6 +12,8 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import time
 from kb_aliases import build_auto_alias_map, apply_alias_map
+import urllib.error
+import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "knowledge_db")
@@ -23,6 +26,7 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 REFUSAL = "В предоставленных данных нет информации."
 MODEL_ID = os.getenv("LLM_MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct").strip()
+LLM_BACKEND = os.getenv("LLM_BACKEND", "local").strip().lower()
 HF_TOKEN = (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or "").strip() or None
 LLM_USE_4BIT = os.getenv("LLM_USE_4BIT", "1").strip().lower() not in {"0", "false", "no"}
 LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "64"))
@@ -38,6 +42,10 @@ if WHISPER_DEVICE == "cuda" and not torch.cuda.is_available():
     WHISPER_DEVICE = "cpu"
 DEFAULT_WHISPER_COMPUTE = "float16" if WHISPER_DEVICE == "cuda" else "int8"
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", DEFAULT_WHISPER_COMPUTE).strip() or DEFAULT_WHISPER_COMPUTE
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8001/v1").strip().rstrip("/")
+VLLM_API_KEY = (os.getenv("VLLM_API_KEY") or "token-abc123").strip()
+VLLM_MODEL = os.getenv("VLLM_MODEL", MODEL_ID).strip() or MODEL_ID
+VLLM_TIMEOUT = float(os.getenv("VLLM_TIMEOUT", "120"))
 QUERY_STOPWORDS = {
     "а", "без", "был", "была", "были", "было", "быть", "в", "во", "вопрос", "все",
     "где", "для", "до", "его", "ее", "если", "есть", "еще", "же", "за", "и", "из",
@@ -76,57 +84,63 @@ print(f"Whisper будет загружен по требованию на: {WHI
 print("Загрузка модели эмбеддингов...")
 embedder = SentenceTransformer("intfloat/multilingual-e5-small", device=embedder_device)
 
-print(f"Загрузка LLM ({MODEL_ID})...")
-if not HF_TOKEN and MODEL_ID.startswith("meta-llama/"):
-    print("HF_TOKEN не задан. Загрузка с Hugging Face сработает только при локальном кеше или активном huggingface-cli login.")
+tokenizer = None
+model = None
 
-tokenizer_kwargs = {}
-if HF_TOKEN:
-    tokenizer_kwargs["token"] = HF_TOKEN
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, **tokenizer_kwargs)
-if tokenizer.pad_token_id is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-model_kwargs = {
-    "trust_remote_code": True,
-    "low_cpu_mem_usage": True,
-}
-if HF_TOKEN:
-    model_kwargs["token"] = HF_TOKEN
-
-if device == "cuda":
-    model_kwargs["torch_dtype"] = torch.float16
-    model_kwargs["device_map"] = {"": 0} if LLM_FORCE_SINGLE_GPU else "auto"
-    if LLM_ATTN_IMPLEMENTATION:
-        model_kwargs["attn_implementation"] = LLM_ATTN_IMPLEMENTATION
+if LLM_BACKEND == "vllm":
+    print(f"LLM backend: vLLM ({VLLM_BASE_URL}, model={VLLM_MODEL})")
 else:
-    model_kwargs["torch_dtype"] = torch.float32
-    print("CUDA недоступна, 4-bit квантование отключено.")
+    print(f"Загрузка LLM ({MODEL_ID})...")
+    if not HF_TOKEN and MODEL_ID.startswith("meta-llama/"):
+        print("HF_TOKEN не задан. Загрузка с Hugging Face сработает только при локальном кеше или активном huggingface-cli login.")
 
-if device == "cuda" and LLM_USE_4BIT:
-    quantized_model_kwargs = dict(model_kwargs)
-    quantized_model_kwargs["quantization_config"] = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16,
-    )
-    try:
-        print("LLM загружается в 4-bit (NF4).")
-        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **quantized_model_kwargs)
-    except Exception as exc:
-        print(f"⚠️ Не удалось загрузить LLM в 4-bit: {exc}")
-        print("⚠️ Переключаемся на обычную загрузку модели без квантования. Если это Colab, причина обычно в несовместимости bitsandbytes/triton.")
-        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
-else:
+    tokenizer_kwargs = {}
+    if HF_TOKEN:
+        tokenizer_kwargs["token"] = HF_TOKEN
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, **tokenizer_kwargs)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model_kwargs = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+    }
+    if HF_TOKEN:
+        model_kwargs["token"] = HF_TOKEN
+
     if device == "cuda":
-        print("LLM загружается без 4-bit квантования.")
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
+        model_kwargs["torch_dtype"] = torch.float16
+        model_kwargs["device_map"] = {"": 0} if LLM_FORCE_SINGLE_GPU else "auto"
+        if LLM_ATTN_IMPLEMENTATION:
+            model_kwargs["attn_implementation"] = LLM_ATTN_IMPLEMENTATION
+    else:
+        model_kwargs["torch_dtype"] = torch.float32
+        print("CUDA недоступна, 4-bit квантование отключено.")
 
-if device != "cuda":
-    model = model.to("cpu")
+    if device == "cuda" and LLM_USE_4BIT:
+        quantized_model_kwargs = dict(model_kwargs)
+        quantized_model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+        try:
+            print("LLM загружается в 4-bit (NF4).")
+            model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **quantized_model_kwargs)
+        except Exception as exc:
+            print(f"⚠️ Не удалось загрузить LLM в 4-bit: {exc}")
+            print("⚠️ Переключаемся на обычную загрузку модели без квантования. Если это Colab, причина обычно в несовместимости bitsandbytes/triton.")
+            model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
+    else:
+        if device == "cuda":
+            print("LLM загружается без 4-bit квантования.")
+        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
 
-model.eval()
+    if device != "cuda":
+        model = model.to("cpu")
+
+    model.eval()
 whisper_model = None
 
 
@@ -523,6 +537,38 @@ def squeeze_to_one_sentence(text: str) -> str:
     return parts[0]
 
 
+def generate_with_vllm(messages: list[dict], max_new_tokens: int) -> str:
+    payload = {
+        "model": VLLM_MODEL,
+        "messages": messages,
+        "max_tokens": max_new_tokens,
+        "temperature": 0,
+    }
+    request = urllib.request.Request(
+        f"{VLLM_BASE_URL}/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {VLLM_API_KEY}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=VLLM_TIMEOUT) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"vLLM HTTP {exc.code}: {detail}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"vLLM request failed: {exc}") from exc
+
+    choices = body.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") or {}
+    return (message.get("content") or "").strip()
+
+
 def generate_answer_strict(query: str, context: str, hits: list[dict] | None = None) -> str:
     brief_answer = wants_brief_answer(query)
 
@@ -563,26 +609,30 @@ def generate_answer_strict(query: str, context: str, hits: list[dict] | None = N
         {"role": "user", "content": user_content},
     ]
 
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=LLM_MAX_INPUT_TOKENS,
-    ).to(device)
+    max_new_tokens = SHORT_LLM_MAX_NEW_TOKENS if brief_answer else LLM_MAX_NEW_TOKENS
+    if LLM_BACKEND == "vllm":
+        text = generate_with_vllm(messages, max_new_tokens)
+    else:
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=LLM_MAX_INPUT_TOKENS,
+        ).to(device)
 
-    with torch.inference_mode():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=SHORT_LLM_MAX_NEW_TOKENS if brief_answer else LLM_MAX_NEW_TOKENS,
-            do_sample=False,
-            use_cache=True,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        with torch.inference_mode():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
 
-    input_len = inputs.input_ids.shape[1]
-    text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        input_len = inputs.input_ids.shape[1]
+        text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"^ответ:\s*", "", text, flags=re.IGNORECASE)
 
