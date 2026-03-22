@@ -29,6 +29,21 @@ def post_json(url: str, payload: dict) -> tuple[dict, float]:
     return json.loads(body), elapsed
 
 
+def wait_for_server(base_url: str, ready_path: str, wait_seconds: float, poll_interval: float) -> bool:
+    ready_url = base_url.rstrip("/") + "/" + ready_path.lstrip("/")
+    deadline = time.time() + wait_seconds
+
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(ready_url, timeout=10) as response:
+                if 200 <= response.status < 500:
+                    return True
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+    return False
+
+
 def format_metric(values: list[float]) -> str:
     if not values:
         return "n/a"
@@ -40,6 +55,9 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Backend base URL.")
     parser.add_argument("--endpoint", default="/query", help="Endpoint to benchmark.")
     parser.add_argument("--repeat", type=int, default=3, help="How many times to run each query.")
+    parser.add_argument("--ready-path", default="/docs", help="Path used to probe server readiness.")
+    parser.add_argument("--wait-seconds", type=float, default=180.0, help="How long to wait for server startup.")
+    parser.add_argument("--poll-interval", type=float, default=2.0, help="Readiness probe interval in seconds.")
     parser.add_argument(
         "--query",
         action="append",
@@ -50,6 +68,14 @@ def main() -> int:
 
     url = args.base_url.rstrip("/") + "/" + args.endpoint.lstrip("/")
     queries = args.queries or DEFAULT_QUERIES
+
+    print(f"Waiting for server: {args.base_url.rstrip('/')}/{args.ready_path.lstrip('/')}")
+    if not wait_for_server(args.base_url, args.ready_path, args.wait_seconds, args.poll_interval):
+        print(
+            "Server did not become ready in time. "
+            "Check server.log or verify that port 8000 is listening before running the benchmark."
+        )
+        return 1
 
     client_totals: list[float] = []
     server_totals: list[float] = []
