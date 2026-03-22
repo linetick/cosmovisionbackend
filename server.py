@@ -41,6 +41,10 @@ REFUSAL_PATTERNS = [
 
 # === Device ===
 device = "cpu"
+embedder_device = os.getenv("EMBEDDER_DEVICE", "cpu").strip().lower() or "cpu"
+if embedder_device == "cuda" and not torch.cuda.is_available():
+    embedder_device = "cpu"
+print(f"Устройство retrieval-эмбеддера: {embedder_device}")
 #device = "cuda" if torch.cuda.is_available() else "cpu"
 #print(f"Используемое устройство: {device}")
 #if device == "cuda":
@@ -48,7 +52,7 @@ device = "cpu"
 
 # === Models ===
 print("Загрузка модели эмбеддингов...")
-embedder = SentenceTransformer("intfloat/multilingual-e5-small", device="cpu")
+embedder = SentenceTransformer("intfloat/multilingual-e5-small", device=embedder_device)
 
 print("Загрузка LLM (Phi-3-mini)...")
 tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3-mini-4k-instruct")
@@ -79,6 +83,8 @@ print("Подключение к базе знаний...")
 #client = chromadb.PersistentClient(path="knowledge_db")
 client = chromadb.PersistentClient(path=DB_PATH)
 collection = client.get_collection("satellites")
+COLLECTION_COUNT = collection.count()
+print(f"Фрагментов в базе знаний: {COLLECTION_COUNT}")
 
 app = FastAPI(title="CosmoVision AI Backend", version="2.1")
 
@@ -258,12 +264,26 @@ def is_refusal_like(text: str) -> bool:
     return any(pattern in normalized for pattern in REFUSAL_PATTERNS)
 
 
-def retrieve_hits(query: str, initial_n: int = 3, max_n: int = 8) -> list[dict]:
-    total_docs = collection.count()
+def retrieve_hits(query: str, initial_n: int = 3, max_n: int = 8) -> tuple[list[dict], dict]:
+    total_docs = COLLECTION_COUNT
+    stats = {
+        "embed": 0.0,
+        "search": 0.0,
+        "postprocess": 0.0,
+        "context_build": 0.0,
+        "total": 0.0,
+    }
     if total_docs <= 0:
-        return []
+        return [], stats
 
-    q_emb = embedder.encode([f"query: {query}"], normalize_embeddings=True)
+    t_embed = time.perf_counter()
+    q_emb = embedder.encode(
+        [f"query: {query}"],
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )
+    stats["embed"] = time.perf_counter() - t_embed
 
     n = min(max(initial_n, 1), total_docs)
     limit = min(max_n, total_docs)
@@ -271,6 +291,7 @@ def retrieve_hits(query: str, initial_n: int = 3, max_n: int = 8) -> list[dict]:
     best_chars = 0
 
     while True:
+        t_search = time.perf_counter()
         try:
             results = collection.query(
                 query_embeddings=q_emb,
@@ -279,7 +300,9 @@ def retrieve_hits(query: str, initial_n: int = 3, max_n: int = 8) -> list[dict]:
             )
         except TypeError:
             results = collection.query(query_embeddings=q_emb, n_results=n)
+        stats["search"] += time.perf_counter() - t_search
 
+        t_post = time.perf_counter()
         docs = (results.get("documents") or [[]])[0]
         distances = (results.get("distances") or [[]])[0]
         metadatas = (results.get("metadatas") or [[]])[0]
@@ -303,8 +326,11 @@ def retrieve_hits(query: str, initial_n: int = 3, max_n: int = 8) -> list[dict]:
             best_chars = context_chars
 
         if context_chars >= 80 or n >= limit:
-            return best_hits
+            stats["postprocess"] += time.perf_counter() - t_post
+            stats["total"] = stats["embed"] + stats["search"] + stats["postprocess"]
+            return best_hits, stats
 
+        stats["postprocess"] += time.perf_counter() - t_post
         n = min(n + 2, limit)
 
 
@@ -324,9 +350,13 @@ def build_context_from_hits(hits: list[dict], max_chars: int = 1800) -> str:
     return "\n\n".join(parts).strip()
 
 
-def retrieve_context(query: str, initial_n: int = 3, max_n: int = 8) -> tuple[str, list[dict]]:
-    hits = retrieve_hits(query, initial_n=initial_n, max_n=max_n)
-    return build_context_from_hits(hits), hits
+def retrieve_context(query: str, initial_n: int = 3, max_n: int = 8) -> tuple[str, list[dict], dict]:
+    hits, stats = retrieve_hits(query, initial_n=initial_n, max_n=max_n)
+    t_context = time.perf_counter()
+    context = build_context_from_hits(hits)
+    stats["context_build"] = time.perf_counter() - t_context
+    stats["total"] = stats["embed"] + stats["search"] + stats["postprocess"] + stats["context_build"]
+    return context, hits, stats
 
 
 def looks_answerable(query: str, context: str) -> bool:
@@ -473,7 +503,7 @@ def handle_query(req: QueryRequest):
             }
 
         t3 = time.time()
-        context, hits = retrieve_context(q, initial_n=3, max_n=9)
+        context, hits, retrieve_stats = retrieve_context(q, initial_n=3, max_n=9)
         t4 = time.time()
 
         if not context:
@@ -485,6 +515,10 @@ def handle_query(req: QueryRequest):
                     "normalize": round(t1 - t0, 3),
                     "topic_check": round(t2 - t1, 3),
                     "retrieve": round(t4 - t3, 3),
+                    "retrieve_embed": round(retrieve_stats["embed"], 3),
+                    "retrieve_search": round(retrieve_stats["search"], 3),
+                    "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
+                    "retrieve_context_build": round(retrieve_stats["context_build"], 3),
                     "total": round(t4 - t0, 3),
                 },
             }
@@ -505,6 +539,10 @@ def handle_query(req: QueryRequest):
                 "normalize": round(t1 - t0, 3),
                 "topic_check": round(t2 - t1, 3),
                 "retrieve": round(t4 - t3, 3),
+                "retrieve_embed": round(retrieve_stats["embed"], 3),
+                "retrieve_search": round(retrieve_stats["search"], 3),
+                "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
+                "retrieve_context_build": round(retrieve_stats["context_build"], 3),
                 "generate": round(t6 - t5, 3),
                 "total": round(t6 - t0, 3),
             },
@@ -560,7 +598,7 @@ async def handle_query_audio(file: UploadFile = File(...)):
             }
 
         t4 = time.time()
-        context, hits = retrieve_context(q, initial_n=3, max_n=9)
+        context, hits, retrieve_stats = retrieve_context(q, initial_n=3, max_n=9)
         t5 = time.time()
 
         if not context:
@@ -574,6 +612,10 @@ async def handle_query_audio(file: UploadFile = File(...)):
                     "normalize": round(t2 - t1, 3),
                     "topic_check": round(t3 - t2, 3),
                     "retrieve": round(t5 - t4, 3),
+                    "retrieve_embed": round(retrieve_stats["embed"], 3),
+                    "retrieve_search": round(retrieve_stats["search"], 3),
+                    "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
+                    "retrieve_context_build": round(retrieve_stats["context_build"], 3),
                     "total": round(t5 - t0, 3),
                 }
             }
@@ -592,6 +634,10 @@ async def handle_query_audio(file: UploadFile = File(...)):
                 "normalize": round(t2 - t1, 3),
                 "topic_check": round(t3 - t2, 3),
                 "retrieve": round(t5 - t4, 3),
+                "retrieve_embed": round(retrieve_stats["embed"], 3),
+                "retrieve_search": round(retrieve_stats["search"], 3),
+                "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
+                "retrieve_context_build": round(retrieve_stats["context_build"], 3),
                 "generate": round(t7 - t6, 3),
                 "total": round(t7 - t0, 3),
             },
@@ -611,8 +657,14 @@ def debug_kb():
 @app.post("/debug/search")
 def debug_search(req: QueryRequest):
     q = normalize_query(req.text)
-    hits = retrieve_hits(q, initial_n=5, max_n=8)
+    hits, retrieve_stats = retrieve_hits(q, initial_n=5, max_n=8)
+    t_context = time.perf_counter()
     context = build_context_from_hits(hits)
+    retrieve_stats["context_build"] = time.perf_counter() - t_context
+    retrieve_stats["total"] = (
+        retrieve_stats["embed"] + retrieve_stats["search"] +
+        retrieve_stats["postprocess"] + retrieve_stats["context_build"]
+    )
     extractive = find_extractive_answer(q, hits)
 
     top = []
@@ -633,11 +685,30 @@ def debug_search(req: QueryRequest):
         "context_chars": len(context),
         "context": context,
         "extractive_answer": extractive,
+        "timing": {
+            "retrieve_embed": round(retrieve_stats["embed"], 3),
+            "retrieve_search": round(retrieve_stats["search"], 3),
+            "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
+            "retrieve_context_build": round(retrieve_stats["context_build"], 3),
+            "retrieve_total": round(retrieve_stats["total"], 3),
+        },
         "top": top,
     }
 
 
 # === Warmup ===
+print("Прогрев retrieval...")
+try:
+    _ = embedder.encode(
+        ["query: что такое спутник"],
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )
+    print("✅ Retrieval прогрет!")
+except Exception as e:
+    print(f"⚠️ Прогрев retrieval завершён с предупреждением: {e}")
+
 print("Прогрев модели...")
 try:
     test_context = "Спутник — это аппарат, обращающийся вокруг Земли."
