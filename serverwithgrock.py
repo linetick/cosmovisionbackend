@@ -48,7 +48,8 @@ SHORT_RAG_MAX_CONTEXT_CHARS = int(os.getenv("SHORT_RAG_MAX_CONTEXT_CHARS", "500"
 LLM_FORCE_SINGLE_GPU = os.getenv("LLM_FORCE_SINGLE_GPU", "1").strip().lower() not in {"0", "false", "no"}
 LLM_ATTN_IMPLEMENTATION = os.getenv("LLM_ATTN_IMPLEMENTATION", "sdpa").strip()
 WHISPER_MODEL_ID = os.getenv("WHISPER_MODEL_ID", "small").strip() or "small"
-WHISPER_DEVICE = (os.getenv("WHISPER_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")).strip().lower()
+default_whisper_device = "cpu" if LLM_BACKEND == "vllm" else ("cuda" if torch.cuda.is_available() else "cpu")
+WHISPER_DEVICE = (os.getenv("WHISPER_DEVICE") or default_whisper_device).strip().lower()
 if WHISPER_DEVICE == "cuda" and not torch.cuda.is_available():
     WHISPER_DEVICE = "cpu"
 DEFAULT_WHISPER_COMPUTE = "float16" if WHISPER_DEVICE == "cuda" else "int8"
@@ -81,15 +82,17 @@ ANSWER_MARKERS = (
 )
 
 # === Device ===
-#device = "cpu"
-device = "cuda" if torch.cuda.is_available() else "cpu"
+BACKEND_GPU_ENABLED = torch.cuda.is_available() and LLM_BACKEND != "vllm"
+device = "cuda" if BACKEND_GPU_ENABLED else "cpu"
 embedder_device = os.getenv("EMBEDDER_DEVICE", "cpu").strip().lower() or "cpu"
-if embedder_device == "cuda" and not torch.cuda.is_available():
+if embedder_device == "cuda" and not BACKEND_GPU_ENABLED:
     embedder_device = "cpu"
 print(f"Используемое устройство: {device}")
 print(f"Устройство retrieval-эмбеддера: {embedder_device}")
 if device == "cuda":
     print(f"GPU: {torch.cuda.get_device_name(0)}")
+elif LLM_BACKEND == "vllm" and torch.cuda.is_available():
+    print("GPU зарезервирована под vLLM; backend работает на CPU.")
 print(f"Whisper будет загружен по требованию на: {WHISPER_DEVICE} ({WHISPER_COMPUTE_TYPE})")
 
 # === Models ===
