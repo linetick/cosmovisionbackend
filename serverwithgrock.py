@@ -37,6 +37,8 @@ LLM_USE_4BIT = os.getenv("LLM_USE_4BIT", "1").strip().lower() not in {"0", "fals
 LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "64"))
 LLM_MAX_INPUT_TOKENS = int(os.getenv("LLM_MAX_INPUT_TOKENS", "2048"))
 RAG_MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "1200"))
+SHORT_LLM_MAX_NEW_TOKENS = int(os.getenv("SHORT_LLM_MAX_NEW_TOKENS", "24"))
+SHORT_RAG_MAX_CONTEXT_CHARS = int(os.getenv("SHORT_RAG_MAX_CONTEXT_CHARS", "500"))
 QUERY_STOPWORDS = {
     "а", "без", "был", "была", "были", "было", "быть", "в", "во", "вопрос", "все",
     "где", "для", "до", "его", "ее", "если", "есть", "еще", "же", "за", "и", "из",
@@ -459,20 +461,53 @@ def is_definitional(q: str) -> bool:
     return any(x in ql for x in ["что такое", "что значит", "определи", "дать определение"])
 
 
+def wants_brief_answer(q: str) -> bool:
+    ql = q.lower()
+    markers = [
+        "кратко", "коротко", "вкратце", "одним предложением",
+        "в одном предложении", "в двух словах", "краткое описание",
+    ]
+    return any(marker in ql for marker in markers)
+
+
+def squeeze_to_one_sentence(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "")).strip()
+    if not normalized:
+        return normalized
+
+    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", normalized) if part.strip()]
+    if not parts:
+        return normalized
+
+    if len(parts) >= 2 and len(parts[0].split()) <= 3 and len(parts[0]) <= 30:
+        header = parts[0].rstrip(".!?")
+        body = parts[1].rstrip()
+        return f"{header}: {body}"
+
+    return parts[0]
+
+
 def generate_answer_strict(query: str, context: str, hits: list[dict] | None = None) -> str:
+    brief_answer = wants_brief_answer(query)
+
     # 1) если можем ответить без LLM — отвечаем без LLM (0 галлюцинаций)
-    if is_definitional(query):
+    if is_definitional(query) or brief_answer:
         defin = extract_definition_from_context(query, context)
         if defin:
-            return defin
+            return squeeze_to_one_sentence(defin) if brief_answer else defin
 
     extractive = find_extractive_answer(query, hits or [])
     if extractive:
-        return extractive
+        return squeeze_to_one_sentence(extractive) if brief_answer else extractive
 
     # 2) для не-определений — LLM, но БЕЗ FACT/ANSWER формата
     if not context.strip():
         return REFUSAL
+
+    if brief_answer and hits:
+        shorter_context = build_context_from_hits(hits, max_chars=SHORT_RAG_MAX_CONTEXT_CHARS)
+        if shorter_context:
+            context = shorter_context
 
     system = (
         "Ты — ИИ-ассистент по космонавтике с RAG.\n"
@@ -481,9 +516,13 @@ def generate_answer_strict(query: str, context: str, hits: list[dict] | None = N
         f"Если в контексте нет ответа, верни ровно: {REFUSAL}"
     )
 
+    user_content = f"КОНТЕКСТ:\n{context}\n\nВОПРОС: {query}"
+    if brief_answer:
+        user_content += "\n\nОтветь одним коротким предложением без вводных слов."
+
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": f"КОНТЕКСТ:\n{context}\n\nВОПРОС: {query}"},
+        {"role": "user", "content": user_content},
     ]
 
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -497,7 +536,7 @@ def generate_answer_strict(query: str, context: str, hits: list[dict] | None = N
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=LLM_MAX_NEW_TOKENS,
+            max_new_tokens=SHORT_LLM_MAX_NEW_TOKENS if brief_answer else LLM_MAX_NEW_TOKENS,
             do_sample=False,
             use_cache=True,
             pad_token_id=tokenizer.eos_token_id,
@@ -514,7 +553,7 @@ def generate_answer_strict(query: str, context: str, hits: list[dict] | None = N
         return REFUSAL
     if is_refusal_like(text):
         return REFUSAL
-    return text
+    return squeeze_to_one_sentence(text) if brief_answer else text
 
 import tempfile, subprocess, os
 
