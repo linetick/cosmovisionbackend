@@ -597,6 +597,60 @@ def generate_with_vllm(messages: list[dict], max_new_tokens: int) -> str:
     return (message.get("content") or "").strip()
 
 
+def run_chat_generation(messages: list[dict], max_new_tokens: int) -> str:
+    if LLM_BACKEND == "vllm":
+        return generate_with_vllm(messages, max_new_tokens)
+
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=LLM_MAX_INPUT_TOKENS,
+    ).to(device)
+
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    input_len = inputs.input_ids.shape[1]
+    return tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+
+
+def generate_answer_llm_only(query: str) -> str:
+    brief_answer = wants_brief_answer(query)
+    max_new_tokens = SHORT_LLM_MAX_NEW_TOKENS if brief_answer else LLM_MAX_NEW_TOKENS
+
+    system = (
+        "Ты ИИ-ассистент по космонавтике.\n"
+        "Отвечай по существу и без лишней воды.\n"
+        "Если пользователь просит кратко, отвечай кратко."
+    )
+
+    user_content = query
+    if brief_answer:
+        user_content += "\n\nОтветь одним коротким предложением."
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+
+    text = run_chat_generation(messages, max_new_tokens)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^ответ:\s*", "", text, flags=re.IGNORECASE)
+
+    if not text or len(text) < 3:
+        return REFUSAL
+    return squeeze_to_one_sentence(text) if brief_answer else text
+
+
 def generate_answer_strict(query: str, context: str, hits: list[dict] | None = None) -> str:
     brief_answer = wants_brief_answer(query)
 
@@ -640,29 +694,7 @@ def generate_answer_strict(query: str, context: str, hits: list[dict] | None = N
     ]
 
     max_new_tokens = SHORT_LLM_MAX_NEW_TOKENS if brief_answer else LLM_MAX_NEW_TOKENS
-    if LLM_BACKEND == "vllm":
-        text = generate_with_vllm(messages, max_new_tokens)
-    else:
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=LLM_MAX_INPUT_TOKENS,
-        ).to(device)
-
-        with torch.inference_mode():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                use_cache=True,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-
-        input_len = inputs.input_ids.shape[1]
-        text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+    text = run_chat_generation(messages, max_new_tokens)
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"^ответ:\s*", "", text, flags=re.IGNORECASE)
 
@@ -794,6 +826,46 @@ def handle_query(req: QueryRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
+
+
+@app.post("/query_llm_only")
+def handle_query_llm_only(req: QueryRequest):
+    try:
+        t0 = time.time()
+        raw = req.text or ""
+        q = normalize_query(raw)
+        t1 = time.time()
+
+        if not q:
+            return {
+                "mode": "llm_only",
+                "query": raw,
+                "answer": REFUSAL,
+                "context_used": False,
+                "timing": {
+                    "normalize": round(t1 - t0, 3),
+                    "total": round(t1 - t0, 3),
+                },
+            }
+
+        t2 = time.time()
+        answer = generate_answer_llm_only(q)
+        t3 = time.time()
+
+        return {
+            "mode": "llm_only",
+            "llm_backend": LLM_BACKEND,
+            "query": q,
+            "answer": answer,
+            "context_used": False,
+            "timing": {
+                "normalize": round(t1 - t0, 3),
+                "generate": round(t3 - t2, 3),
+                "total": round(t3 - t0, 3),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка LLM-only обработки: {str(e)}")
 
 @app.post("/query_audio")
 async def handle_query_audio(file: UploadFile = File(...)):
