@@ -28,6 +28,14 @@ LLM_MAX_INPUT_TOKENS = int(os.getenv("LLM_MAX_INPUT_TOKENS", "2048"))
 RAG_MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "1200"))
 SHORT_LLM_MAX_NEW_TOKENS = int(os.getenv("SHORT_LLM_MAX_NEW_TOKENS", "24"))
 SHORT_RAG_MAX_CONTEXT_CHARS = int(os.getenv("SHORT_RAG_MAX_CONTEXT_CHARS", "500"))
+LLM_FORCE_SINGLE_GPU = os.getenv("LLM_FORCE_SINGLE_GPU", "1").strip().lower() not in {"0", "false", "no"}
+LLM_ATTN_IMPLEMENTATION = os.getenv("LLM_ATTN_IMPLEMENTATION", "sdpa").strip()
+WHISPER_MODEL_ID = os.getenv("WHISPER_MODEL_ID", "small").strip() or "small"
+WHISPER_DEVICE = (os.getenv("WHISPER_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")).strip().lower()
+if WHISPER_DEVICE == "cuda" and not torch.cuda.is_available():
+    WHISPER_DEVICE = "cpu"
+DEFAULT_WHISPER_COMPUTE = "float16" if WHISPER_DEVICE == "cuda" else "int8"
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", DEFAULT_WHISPER_COMPUTE).strip() or DEFAULT_WHISPER_COMPUTE
 QUERY_STOPWORDS = {
     "а", "без", "был", "была", "были", "было", "быть", "в", "во", "вопрос", "все",
     "где", "для", "до", "его", "ее", "если", "есть", "еще", "же", "за", "и", "из",
@@ -56,6 +64,7 @@ print(f"Используемое устройство: {device}")
 print(f"Устройство retrieval-эмбеддера: {embedder_device}")
 if device == "cuda":
     print(f"GPU: {torch.cuda.get_device_name(0)}")
+print(f"Whisper будет загружен по требованию на: {WHISPER_DEVICE} ({WHISPER_COMPUTE_TYPE})")
 
 # === Models ===
 print("Загрузка модели эмбеддингов...")
@@ -74,13 +83,16 @@ if tokenizer.pad_token_id is None:
 
 model_kwargs = {
     "trust_remote_code": True,
+    "low_cpu_mem_usage": True,
 }
 if HF_TOKEN:
     model_kwargs["token"] = HF_TOKEN
 
 if device == "cuda":
-    model_kwargs["device_map"] = "auto"
     model_kwargs["torch_dtype"] = torch.float16
+    model_kwargs["device_map"] = {"": 0} if LLM_FORCE_SINGLE_GPU else "auto"
+    if LLM_ATTN_IMPLEMENTATION:
+        model_kwargs["attn_implementation"] = LLM_ATTN_IMPLEMENTATION
 else:
     model_kwargs["torch_dtype"] = torch.float32
     print("CUDA недоступна, 4-bit квантование отключено.")
@@ -109,11 +121,19 @@ if device != "cuda":
     model = model.to("cpu")
 
 model.eval()
+whisper_model = None
 
-print("Загрузка Whisper (faster-whisper)...")
-whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
-whisper_compute = "float16" if whisper_device == "cuda" else "int8"
-whisper_model = WhisperModel("small", device=whisper_device, compute_type=whisper_compute)
+
+def get_whisper_model() -> WhisperModel:
+    global whisper_model
+    if whisper_model is None:
+        print(f"Загрузка Whisper ({WHISPER_MODEL_ID}) на {WHISPER_DEVICE}...")
+        whisper_model = WhisperModel(
+            WHISPER_MODEL_ID,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE_TYPE,
+        )
+    return whisper_model
 
 # === Chroma ===
 print("Подключение к базе знаний...")
@@ -136,6 +156,9 @@ def normalize_query(q: str) -> str:
     q = (q or "").strip()
     q = re.sub(r"\s+", " ", q)
     q = re.sub(r"метреор", "метеор", q, flags=re.IGNORECASE)
+    q = re.sub(r"\bтакй\b", "такой", q, flags=re.IGNORECASE)
+    q = re.sub(r"\bтакя\b", "такая", q, flags=re.IGNORECASE)
+    q = re.sub(r"\bтаке\b", "такое", q, flags=re.IGNORECASE)
     return q
 
 
@@ -433,7 +456,9 @@ def extract_definition_from_context(query: str, context: str) -> str | None:
 
 def is_definitional(q: str) -> bool:
     ql = q.lower()
-    return any(x in ql for x in ["что такое", "что значит", "определи", "дать определение"])
+    if any(x in ql for x in ["что такое", "что значит", "определи", "дать определение"]):
+        return True
+    return re.search(r"\b(кто|что)\s+так[а-яё]*\b", ql) is not None
 
 
 def wants_brief_answer(q: str) -> bool:
@@ -533,7 +558,7 @@ def transcribe_audio_bytes(data: bytes, language: str = "ru") -> str:
         tmp.write(data)
         tmp.flush()
 
-        segments, info = whisper_model.transcribe(
+        segments, info = get_whisper_model().transcribe(
             tmp.name,
             language=language,   # "ru" или None (авто)
             vad_filter=True,     # ускоряет на паузах
