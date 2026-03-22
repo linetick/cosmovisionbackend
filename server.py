@@ -54,6 +54,10 @@ REFUSAL_PATTERNS = [
     "не найдено", "не указ", "не опис", "не содерж", "не сказан", "не сообщ",
     "не упомина", "не удалось найти", "нет данных", "отсутствуют данные",
 ]
+ANSWER_MARKERS = (
+    "— это", "это ", "предназнач", "используется", "служит для",
+    "представляет собой", "позволяет", "состоит", "имеет",
+)
 
 # === Device ===
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -242,6 +246,33 @@ def query_token_sets(query: str) -> tuple[set[str], set[str]]:
     }
     strong_tokens = {tok for tok in query_tokens if tok not in WEAK_QUERY_TOKENS}
     return query_tokens, strong_tokens
+
+
+def assess_context_relevance(query: str, context: str) -> dict:
+    query_tokens, strong_tokens = query_token_sets(query)
+    context_tokens = set(tokenize_for_match(context))
+    total_overlap = len(query_tokens & context_tokens)
+    strong_overlap = len(strong_tokens & context_tokens)
+    return {
+        "query_tokens": len(query_tokens),
+        "strong_tokens": len(strong_tokens),
+        "total_overlap": total_overlap,
+        "strong_overlap": strong_overlap,
+        "has_answer_marker": any(marker in context.lower() for marker in ANSWER_MARKERS),
+    }
+
+
+def has_sufficient_context_relevance(query: str, context: str) -> tuple[bool, dict]:
+    metrics = assess_context_relevance(query, context)
+    if metrics["query_tokens"] == 0:
+        return False, metrics
+    if metrics["strong_overlap"] > 0:
+        return True, metrics
+    if metrics["total_overlap"] >= 2:
+        return True, metrics
+    if metrics["total_overlap"] >= 1 and metrics["has_answer_marker"]:
+        return True, metrics
+    return False, metrics
 
 
 def split_doc_candidates(doc: str) -> list[str]:
@@ -507,6 +538,10 @@ def generate_answer_strict(query: str, context: str, hits: list[dict] | None = N
         if shorter_context:
             context = shorter_context
 
+    relevant, _ = has_sufficient_context_relevance(query, context)
+    if not relevant:
+        return REFUSAL
+
     system = (
         "Ты — ИИ-ассистент по космонавтике с RAG.\n"
         "Отвечай только по фрагментам базы знаний из блока КОНТЕКСТ.\n"
@@ -771,6 +806,7 @@ def debug_search(req: QueryRequest):
         retrieve_stats["postprocess"] + retrieve_stats["context_build"]
     )
     extractive = find_extractive_answer(q, hits)
+    relevant, relevance = has_sufficient_context_relevance(q, context)
 
     top = []
     for i, hit in enumerate(hits):
@@ -790,6 +826,8 @@ def debug_search(req: QueryRequest):
         "context_chars": len(context),
         "context": context,
         "extractive_answer": extractive,
+        "relevance": relevance,
+        "context_relevant": relevant,
         "timing": {
             "retrieve_embed": round(retrieve_stats["embed"], 3),
             "retrieve_search": round(retrieve_stats["search"], 3),
