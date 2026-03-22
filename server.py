@@ -10,9 +10,11 @@ from sentence_transformers import SentenceTransformer
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import time
+from kb_aliases import build_auto_alias_map, apply_alias_map
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "knowledge_db")
+RAW_KB_DIR = os.path.join(BASE_DIR, "knowledge_raw")
 print("SERVER DB_PATH =", DB_PATH)
 print("SERVER CWD =", os.getcwd())
 
@@ -146,6 +148,8 @@ client = chromadb.PersistentClient(path=DB_PATH)
 collection = client.get_collection("satellites")
 COLLECTION_COUNT = collection.count()
 print(f"Фрагментов в базе знаний: {COLLECTION_COUNT}")
+AUTO_QUERY_ALIASES = build_auto_alias_map(RAW_KB_DIR, QUERY_STOPWORDS)
+print(f"Автоматических алиасов из БЗ: {len(AUTO_QUERY_ALIASES)}")
 
 app = FastAPI(title="CosmoVision AI Backend", version="2.1")
 
@@ -159,6 +163,7 @@ def normalize_query(q: str) -> str:
     """Мини-нормализация: прибираем мусор и частые опечатки."""
     q = (q or "").strip()
     q = re.sub(r"\s+", " ", q)
+    q = apply_alias_map(q, AUTO_QUERY_ALIASES)
     q = re.sub(r"метреор", "метеор", q, flags=re.IGNORECASE)
     q = re.sub(r"\bтакй\b", "такой", q, flags=re.IGNORECASE)
     q = re.sub(r"\bтакя\b", "такая", q, flags=re.IGNORECASE)
