@@ -490,13 +490,26 @@ def transcribe_audio_bytes(data: bytes, language: str = "ru") -> str:
 @app.post("/query")
 def handle_query(req: QueryRequest):
     try:
+        t0 = time.time()
         raw = req.text or ""
         q = normalize_query(raw)
+        t1 = time.time()
 
         if not q:
-            return {"query": raw, "answer": REFUSAL, "context_used": False}
+            return {
+                "query": raw,
+                "answer": REFUSAL,
+                "context_used": False,
+                "timing": {
+                    "normalize": round(t1 - t0, 3),
+                    "total": round(t1 - t0, 3),
+                },
+            }
 
-        if is_off_topic(q):
+        off_topic = is_off_topic(q)
+        t2 = time.time()
+
+        if off_topic:
             return {
                 "query": q,
                 "answer": (
@@ -504,18 +517,44 @@ def handle_query(req: QueryRequest):
                     "Спроси, например: «Как устроены солнечные панели на Метеоре-М?»"
                 ),
                 "context_used": False,
+                "timing": {
+                    "normalize": round(t1 - t0, 3),
+                    "topic_check": round(t2 - t1, 3),
+                    "total": round(t2 - t0, 3),
+                },
             }
 
+        t3 = time.time()
         context, hits = retrieve_context(q, initial_n=3, max_n=9)
+        t4 = time.time()
         if not context:
-            return {"query": q, "answer": REFUSAL, "context_used": False}
+            return {
+                "query": q,
+                "answer": REFUSAL,
+                "context_used": False,
+                "timing": {
+                    "normalize": round(t1 - t0, 3),
+                    "topic_check": round(t2 - t1, 3),
+                    "retrieve": round(t4 - t3, 3),
+                    "total": round(t4 - t0, 3),
+                },
+            }
 
+        t5 = time.time()
         answer = generate_answer_strict(q, context, hits)
+        t6 = time.time()
 
         return {
             "query": q,
             "answer": answer,
             "context_used": (answer != REFUSAL),
+            "timing": {
+                "normalize": round(t1 - t0, 3),
+                "topic_check": round(t2 - t1, 3),
+                "retrieve": round(t4 - t3, 3),
+                "generate": round(t6 - t5, 3),
+                "total": round(t6 - t0, 3),
+            },
         }
 
     except Exception as e:
@@ -533,11 +572,24 @@ async def handle_query_audio(file: UploadFile = File(...)):
         t1 = time.time()
 
         q = normalize_query(transcript)
+        t2 = time.time()
 
         if not q:
-            return {"answer": REFUSAL, "context_used": False, "transcript": transcript}
+            return {
+                "answer": REFUSAL,
+                "context_used": False,
+                "transcript": transcript,
+                "timing": {
+                    "asr": round(t1 - t0, 3),
+                    "normalize": round(t2 - t1, 3),
+                    "total": round(t2 - t0, 3),
+                },
+            }
 
-        if is_off_topic(q):
+        off_topic = is_off_topic(q)
+        t3 = time.time()
+
+        if off_topic:
             return {
                 "transcript": transcript,
                 "query": q,
@@ -546,12 +598,17 @@ async def handle_query_audio(file: UploadFile = File(...)):
                     "Спроси, например: «Как устроены солнечные панели на Метеоре-М?»"
                 ),
                 "context_used": False,
-                "timing": {"asr": round(t1 - t0, 3)}
+                "timing": {
+                    "asr": round(t1 - t0, 3),
+                    "normalize": round(t2 - t1, 3),
+                    "topic_check": round(t3 - t2, 3),
+                    "total": round(t3 - t0, 3),
+                }
             }
 
-        t2 = time.time()
+        t4 = time.time()
         context, hits = retrieve_context(q, initial_n=3, max_n=9)
-        t3 = time.time()
+        t5 = time.time()
 
         if not context:
             return {
@@ -559,11 +616,18 @@ async def handle_query_audio(file: UploadFile = File(...)):
                 "query": q,
                 "answer": REFUSAL,
                 "context_used": False,
-                "timing": {"asr": round(t1 - t0, 3), "retrieve": round(t3 - t2, 3)}
+                "timing": {
+                    "asr": round(t1 - t0, 3),
+                    "normalize": round(t2 - t1, 3),
+                    "topic_check": round(t3 - t2, 3),
+                    "retrieve": round(t5 - t4, 3),
+                    "total": round(t5 - t0, 3),
+                }
             }
 
+        t6 = time.time()
         answer = generate_answer_strict(q, context, hits)
-        t4 = time.time()
+        t7 = time.time()
 
         return {
             "transcript": transcript,
@@ -572,9 +636,11 @@ async def handle_query_audio(file: UploadFile = File(...)):
             "context_used": (answer != REFUSAL),
             "timing": {
                 "asr": round(t1 - t0, 3),
-                "retrieve": round(t3 - t2, 3),
-                "generate": round(t4 - t3, 3),
-                "total": round(t4 - t0, 3),
+                "normalize": round(t2 - t1, 3),
+                "topic_check": round(t3 - t2, 3),
+                "retrieve": round(t5 - t4, 3),
+                "generate": round(t7 - t6, 3),
+                "total": round(t7 - t0, 3),
             },
         }
 
