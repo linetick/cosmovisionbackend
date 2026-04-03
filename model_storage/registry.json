@@ -1,1 +1,11 @@
-[]
+[
+  {
+    "id": "sputnik-1",
+    "name": "Спутник-1",
+    "description": "Первый искусственный спутник Земли, запущенный 4 октября 1957 года.",
+    "spacecraft": "Спутник-1",
+    "format": "fbx",
+    "file_name": "Sputnik-1.fbx",
+    "relative_path": "Sputnik-1.fbx"
+  }
+]
