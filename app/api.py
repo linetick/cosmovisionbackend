@@ -17,7 +17,7 @@ from .query_logic import (
     normalize_query,
     retrieve_context,
     retrieve_hits,
-    transcribe_audio_bytes,
+    transcribe_audio_bytes_detailed,
 )
 from .runtime import collection, warmup
 
@@ -155,7 +155,7 @@ async def handle_query_audio(file: UploadFile = File(...)):
             return {"answer": REFUSAL, "context_used": False, "transcript": ""}
 
         t0 = time.time()
-        transcript = transcribe_audio_bytes(audio_bytes, language="ru")
+        transcript, asr_stats = transcribe_audio_bytes_detailed(audio_bytes, language="ru")
         t1 = time.time()
         q = normalize_query(transcript)
         t2 = time.time()
@@ -167,6 +167,8 @@ async def handle_query_audio(file: UploadFile = File(...)):
                 "transcript": transcript,
                 "timing": {
                     "asr": round(t1 - t0, 3),
+                    "audio_prepare": round(asr_stats["audio_prepare"], 3),
+                    "transcribe": round(asr_stats["transcribe"], 3),
                     "normalize": round(t2 - t1, 3),
                     "total": round(t2 - t0, 3),
                 },
@@ -185,6 +187,8 @@ async def handle_query_audio(file: UploadFile = File(...)):
                 "context_used": False,
                 "timing": {
                     "asr": round(t1 - t0, 3),
+                    "audio_prepare": round(asr_stats["audio_prepare"], 3),
+                    "transcribe": round(asr_stats["transcribe"], 3),
                     "normalize": round(t2 - t1, 3),
                     "topic_check": round(t3 - t2, 3),
                     "total": round(t3 - t0, 3),
@@ -202,6 +206,8 @@ async def handle_query_audio(file: UploadFile = File(...)):
                 "context_used": False,
                 "timing": {
                     "asr": round(t1 - t0, 3),
+                    "audio_prepare": round(asr_stats["audio_prepare"], 3),
+                    "transcribe": round(asr_stats["transcribe"], 3),
                     "normalize": round(t2 - t1, 3),
                     "topic_check": round(t3 - t2, 3),
                     "retrieve": round(t5 - t4, 3),
@@ -223,6 +229,8 @@ async def handle_query_audio(file: UploadFile = File(...)):
             "context_used": (answer != REFUSAL),
             "timing": {
                 "asr": round(t1 - t0, 3),
+                "audio_prepare": round(asr_stats["audio_prepare"], 3),
+                "transcribe": round(asr_stats["transcribe"], 3),
                 "normalize": round(t2 - t1, 3),
                 "topic_check": round(t3 - t2, 3),
                 "retrieve": round(t5 - t4, 3),

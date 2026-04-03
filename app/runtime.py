@@ -20,6 +20,7 @@ from .config import (
     RAW_KB_DIR,
     VLLM_BASE_URL,
     VLLM_MODEL,
+    WHISPER_PRELOAD,
     WHISPER_MODEL_ID,
 )
 
@@ -122,6 +123,18 @@ def get_whisper_model() -> WhisperModel:
     return whisper_model
 
 
+def preload_whisper() -> None:
+    if not WHISPER_PRELOAD:
+        print("Предзагрузка Whisper отключена.")
+        return
+
+    try:
+        get_whisper_model()
+        print("✅ Whisper предзагружен.")
+    except Exception as exc:
+        print(f"⚠️ Предзагрузка Whisper завершилась с предупреждением: {exc}")
+
+
 print("Подключение к базе знаний...")
 client = chromadb.PersistentClient(path=DB_PATH)
 collection = client.get_collection("satellites")
@@ -132,6 +145,8 @@ print(f"Автоматических алиасов из БЗ: {len(AUTO_QUERY_A
 
 
 def warmup(retrieve_probe, generation_probe) -> None:
+    preload_whisper()
+
     print("Прогрев retrieval...")
     try:
         _ = embedder.encode(

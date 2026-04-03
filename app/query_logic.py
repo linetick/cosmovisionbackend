@@ -27,6 +27,8 @@ from .config import (
     VLLM_MODEL,
     VLLM_TIMEOUT,
     WEAK_QUERY_TOKENS,
+    WHISPER_BEAM_SIZE,
+    WHISPER_VAD_FILTER,
 )
 from .runtime import (
     AUTO_QUERY_ALIASES,
@@ -533,15 +535,34 @@ def wav_to_16k_mono_wav_bytes(wav_bytes: bytes) -> bytes:
                 pass
 
 
-def transcribe_audio_bytes(data: bytes, language: str = "ru") -> str:
+def transcribe_audio_bytes_detailed(data: bytes, language: str = "ru") -> tuple[str, dict]:
+    stats = {
+        "audio_prepare": 0.0,
+        "transcribe": 0.0,
+        "total": 0.0,
+    }
+
+    t_prepare = time.perf_counter()
     data = wav_to_16k_mono_wav_bytes(data)
+    stats["audio_prepare"] = time.perf_counter() - t_prepare
+
+    t_transcribe = time.perf_counter()
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
         tmp.write(data)
         tmp.flush()
         segments, _ = get_whisper_model().transcribe(
             tmp.name,
             language=language,
-            vad_filter=True,
-            beam_size=5,
+            vad_filter=WHISPER_VAD_FILTER,
+            beam_size=WHISPER_BEAM_SIZE,
+            condition_on_previous_text=False,
         )
-        return " ".join(seg.text for seg in segments).strip()
+        transcript = " ".join(seg.text for seg in segments).strip()
+    stats["transcribe"] = time.perf_counter() - t_transcribe
+    stats["total"] = stats["audio_prepare"] + stats["transcribe"]
+    return transcript, stats
+
+
+def transcribe_audio_bytes(data: bytes, language: str = "ru") -> str:
+    transcript, _ = transcribe_audio_bytes_detailed(data, language=language)
+    return transcript

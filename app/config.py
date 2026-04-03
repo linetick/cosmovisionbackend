@@ -27,6 +27,9 @@ LLM_FORCE_SINGLE_GPU = os.getenv("LLM_FORCE_SINGLE_GPU", "1").strip().lower() no
 LLM_ATTN_IMPLEMENTATION = os.getenv("LLM_ATTN_IMPLEMENTATION", "sdpa").strip()
 
 WHISPER_MODEL_ID = os.getenv("WHISPER_MODEL_ID", "small").strip() or "small"
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
+WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "0").strip().lower() not in {"0", "false", "no"}
+WHISPER_PRELOAD = os.getenv("WHISPER_PRELOAD", "1").strip().lower() not in {"0", "false", "no"}
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8001/v1").strip().rstrip("/")
 VLLM_API_KEY = (os.getenv("VLLM_API_KEY") or "token-abc123").strip()
 VLLM_MODEL = os.getenv("VLLM_MODEL", MODEL_ID).strip() or MODEL_ID
