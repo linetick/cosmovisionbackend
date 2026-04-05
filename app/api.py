@@ -8,8 +8,9 @@ from pydantic import BaseModel
 from .config import APP_TITLE, APP_VERSION, DB_PATH, MODEL_FILES_DIR, MODEL_REGISTRY_PATH, REFUSAL
 from .model_store import ensure_model_storage, get_model_file_path, get_model_metadata, list_models
 from .query_logic import (
+    COMMAND_ANSWERS,
     build_context_from_hits,
-    classify_client_command_with_llm,
+    classify_query_with_llm,
     detect_client_command,
     find_extractive_answer,
     generate_answer_llm_only,
@@ -58,30 +59,40 @@ def unknown_command_response(query: str) -> dict:
 def resolve_client_command(query: str) -> tuple[dict | None, dict]:
     debug = {
         "normalized_query": query,
+        "llm_route": None,
         "rule_match": None,
         "looks_like_command": False,
-        "llm_match": None,
         "resolution": "knowledge_answer",
     }
+
+    llm_route = classify_query_with_llm(query)
+    if llm_route:
+        debug["llm_route"] = llm_route
+        if llm_route["intent"] == "client_command":
+            debug["resolution"] = "llm_client_command"
+            return {
+                "type": llm_route["command_type"],
+                "answer": COMMAND_ANSWERS[llm_route["command_type"]],
+            }, debug
+        if llm_route["intent"] == "unknown_command":
+            debug["resolution"] = "llm_unknown_command"
+            return None, debug
+        debug["resolution"] = "llm_knowledge_answer"
+        return None, debug
 
     matched_command = detect_client_command(query)
     if matched_command:
         debug["rule_match"] = matched_command["type"]
-        debug["resolution"] = "rule_match"
+        debug["resolution"] = "fallback_rule_match"
         return matched_command, debug
 
     looks_like = looks_like_client_command(query)
     debug["looks_like_command"] = looks_like
-    if not looks_like:
+    if looks_like:
+        debug["resolution"] = "fallback_unknown_command"
         return None, debug
 
-    llm_command = classify_client_command_with_llm(query)
-    if llm_command:
-        debug["llm_match"] = llm_command["type"]
-        debug["resolution"] = "llm_match"
-        return llm_command, debug
-
-    debug["resolution"] = "unknown_command"
+    debug["resolution"] = "fallback_knowledge_answer"
     return None, debug
 
 

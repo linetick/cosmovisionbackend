@@ -45,6 +45,9 @@ COMMAND_PHRASES = {
     "start_rotation": (
         "вращай", "повращай", "крути", "покрути", "начни вращение",
         "запусти вращение", "вращение", "верти", "заверти",
+        "поверни", "повернуть", "разверни", "развернуть",
+        "поверни спутник", "повернуть спутник",
+        "поверни текущий спутник", "повернуть текущий спутник",
     ),
     "stop_rotation": (
         "останови вращение", "останови спутник", "не вращай", "хватит вращать",
@@ -78,7 +81,7 @@ COMMAND_ANSWERS = {
 }
 
 COMMAND_LIKE_MARKERS = (
-    "вращ", "крут", "верт", "останов", "стоп",
+    "вращ", "крут", "верт", "поверн", "разверн", "останов", "стоп",
     "увелич", "приблиз", "уменьш", "отдал",
     "сброс", "верни обратно", "исходный вид",
     "анимац", "анимир", "оживи", "движени",
@@ -165,14 +168,19 @@ def _extract_json_object(text: str) -> dict | None:
         return None
 
 
-def classify_client_command_with_llm(query: str) -> dict | None:
+def classify_query_with_llm(query: str) -> dict | None:
     allowed = ", ".join(COMMAND_TYPES)
     system = (
-        "Ты классификатор пользовательских команд для AR-приложения.\n"
-        "Нужно выбрать только одну из допустимых команд или вернуть unknown_command.\n"
-        f"Допустимые команды: {allowed}.\n"
-        "Верни только JSON без пояснений в одном из двух форматов:\n"
+        "Ты маршрутизатор запросов для AR-приложения про космические аппараты.\n"
+        "Нужно отнести запрос ровно к одной категории:\n"
+        "1. client_command — если пользователь хочет управлять 3D-моделью.\n"
+        "2. knowledge_answer — если пользователь задаёт вопрос по знаниям о космическом аппарате.\n"
+        "3. unknown_command — если пользователь, вероятно, хочет управлять моделью, но команда не входит в допустимый список.\n"
+        f"Допустимые client_command: {allowed}.\n"
+        "Верни только JSON без пояснений.\n"
+        "Форматы ответа:\n"
         '{"intent":"client_command","command_type":"start_rotation"}\n'
+        '{"intent":"knowledge_answer"}\n'
         '{"intent":"unknown_command"}'
     )
     user = f"Запрос пользователя: {query}"
@@ -190,6 +198,10 @@ def classify_client_command_with_llm(query: str) -> dict | None:
         return None
 
     intent = (parsed.get("intent") or "").strip()
+    if intent == "knowledge_answer":
+        return {"intent": "knowledge_answer"}
+    if intent == "unknown_command":
+        return {"intent": "unknown_command"}
     if intent != "client_command":
         return None
 
@@ -198,8 +210,8 @@ def classify_client_command_with_llm(query: str) -> dict | None:
         return None
 
     return {
-        "type": command_type,
-        "answer": COMMAND_ANSWERS[command_type],
+        "intent": "client_command",
+        "command_type": command_type,
     }
 
 
