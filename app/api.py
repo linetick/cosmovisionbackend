@@ -34,10 +34,10 @@ app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 ensure_model_storage()
 
 
-def command_response(query: str, command_type: str, answer: str) -> dict:
+def command_response(query: str, command_type: str, answer: str, intent: str = "client_command") -> dict:
     return {
         "query": query,
-        "intent": "client_command",
+        "intent": intent,
         "client_command": {
             "type": command_type,
         },
@@ -56,6 +56,13 @@ def unknown_command_response(query: str) -> dict:
     }
 
 
+def build_compound_answer(command_answer: str, knowledge_answer: str) -> str:
+    knowledge_answer = (knowledge_answer or "").strip()
+    if not knowledge_answer or knowledge_answer == REFUSAL:
+        return f"{command_answer} {REFUSAL}"
+    return f"{command_answer} {knowledge_answer}"
+
+
 def resolve_client_command(query: str) -> tuple[dict | None, dict]:
     debug = {
         "normalized_query": query,
@@ -71,6 +78,14 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
         if llm_route["intent"] == "client_command":
             debug["resolution"] = "llm_client_command"
             return {
+                "intent": "client_command",
+                "type": llm_route["command_type"],
+                "answer": COMMAND_ANSWERS[llm_route["command_type"]],
+            }, debug
+        if llm_route["intent"] == "compound":
+            debug["resolution"] = "llm_compound"
+            return {
+                "intent": "compound",
                 "type": llm_route["command_type"],
                 "answer": COMMAND_ANSWERS[llm_route["command_type"]],
             }, debug
@@ -84,7 +99,11 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
     if matched_command:
         debug["rule_match"] = matched_command["type"]
         debug["resolution"] = "fallback_rule_match"
-        return matched_command, debug
+        return {
+            "intent": "client_command",
+            "type": matched_command["type"],
+            "answer": matched_command["answer"],
+        }, debug
 
     looks_like = looks_like_client_command(query)
     debug["looks_like_command"] = looks_like
@@ -118,7 +137,7 @@ def handle_query(req: QueryRequest):
             }
 
         matched_command, command_debug = resolve_client_command(q)
-        if matched_command:
+        if matched_command and matched_command["intent"] == "client_command":
             result = command_response(q, matched_command["type"], matched_command["answer"])
             result["timing"] = {
                 "normalize": round(t1 - t0, 3),
@@ -126,7 +145,7 @@ def handle_query(req: QueryRequest):
             }
             return result
 
-        if command_debug["resolution"] == "unknown_command":
+        if command_debug["resolution"] in {"llm_unknown_command", "fallback_unknown_command"}:
             result = unknown_command_response(q)
             result["timing"] = {
                 "normalize": round(t1 - t0, 3),
@@ -136,7 +155,7 @@ def handle_query(req: QueryRequest):
 
         off_topic = is_off_topic(q)
         t2 = time.time()
-        if off_topic:
+        if off_topic and not (matched_command and matched_command["intent"] == "compound"):
             return {
                 "query": q,
                 "intent": "off_topic",
@@ -157,6 +176,26 @@ def handle_query(req: QueryRequest):
         context, hits, retrieve_stats = retrieve_context(q, initial_n=3, max_n=9)
         t4 = time.time()
         if not context:
+            if matched_command and matched_command["intent"] == "compound":
+                return {
+                    "query": q,
+                    "intent": "compound",
+                    "client_command": {
+                        "type": matched_command["type"],
+                    },
+                    "answer": build_compound_answer(matched_command["answer"], REFUSAL),
+                    "context_used": False,
+                    "timing": {
+                        "normalize": round(t1 - t0, 3),
+                        "topic_check": round(t2 - t1, 3),
+                        "retrieve": round(t4 - t3, 3),
+                        "retrieve_embed": round(retrieve_stats["embed"], 3),
+                        "retrieve_search": round(retrieve_stats["search"], 3),
+                        "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
+                        "retrieve_context_build": round(retrieve_stats["context_build"], 3),
+                        "total": round(t4 - t0, 3),
+                    },
+                }
             return {
                 "query": q,
                 "intent": "knowledge_answer",
@@ -178,6 +217,27 @@ def handle_query(req: QueryRequest):
         t5 = time.time()
         answer = generate_answer_strict(q, context, hits)
         t6 = time.time()
+        if matched_command and matched_command["intent"] == "compound":
+            return {
+                "query": q,
+                "intent": "compound",
+                "client_command": {
+                    "type": matched_command["type"],
+                },
+                "answer": build_compound_answer(matched_command["answer"], answer),
+                "context_used": (answer != REFUSAL),
+                "timing": {
+                    "normalize": round(t1 - t0, 3),
+                    "topic_check": round(t2 - t1, 3),
+                    "retrieve": round(t4 - t3, 3),
+                    "retrieve_embed": round(retrieve_stats["embed"], 3),
+                    "retrieve_search": round(retrieve_stats["search"], 3),
+                    "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
+                    "retrieve_context_build": round(retrieve_stats["context_build"], 3),
+                    "generate": round(t6 - t5, 3),
+                    "total": round(t6 - t0, 3),
+                },
+            }
         return {
             "query": q,
             "intent": "knowledge_answer",
@@ -278,7 +338,7 @@ async def handle_query_audio(file: UploadFile = File(...)):
             }
 
         matched_command, command_debug = resolve_client_command(q)
-        if matched_command:
+        if matched_command and matched_command["intent"] == "client_command":
             result = command_response(q, matched_command["type"], matched_command["answer"])
             result["transcript"] = transcript
             result["timing"] = {
@@ -290,7 +350,7 @@ async def handle_query_audio(file: UploadFile = File(...)):
             }
             return result
 
-        if command_debug["resolution"] == "unknown_command":
+        if command_debug["resolution"] in {"llm_unknown_command", "fallback_unknown_command"}:
             result = unknown_command_response(q)
             result["transcript"] = transcript
             result["timing"] = {
@@ -304,7 +364,7 @@ async def handle_query_audio(file: UploadFile = File(...)):
 
         off_topic = is_off_topic(q)
         t3 = time.time()
-        if off_topic:
+        if off_topic and not (matched_command and matched_command["intent"] == "compound"):
             return {
                 "transcript": transcript,
                 "query": q,
@@ -329,6 +389,30 @@ async def handle_query_audio(file: UploadFile = File(...)):
         context, hits, retrieve_stats = retrieve_context(q, initial_n=3, max_n=9)
         t5 = time.time()
         if not context:
+            if matched_command and matched_command["intent"] == "compound":
+                return {
+                    "transcript": transcript,
+                    "query": q,
+                    "intent": "compound",
+                    "client_command": {
+                        "type": matched_command["type"],
+                    },
+                    "answer": build_compound_answer(matched_command["answer"], REFUSAL),
+                    "context_used": False,
+                    "timing": {
+                        "asr": round(t1 - t0, 3),
+                        "audio_prepare": round(asr_stats["audio_prepare"], 3),
+                        "transcribe": round(asr_stats["transcribe"], 3),
+                        "normalize": round(t2 - t1, 3),
+                        "topic_check": round(t3 - t2, 3),
+                        "retrieve": round(t5 - t4, 3),
+                        "retrieve_embed": round(retrieve_stats["embed"], 3),
+                        "retrieve_search": round(retrieve_stats["search"], 3),
+                        "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
+                        "retrieve_context_build": round(retrieve_stats["context_build"], 3),
+                        "total": round(t5 - t0, 3),
+                    },
+                }
             return {
                 "transcript": transcript,
                 "query": q,
@@ -354,6 +438,31 @@ async def handle_query_audio(file: UploadFile = File(...)):
         t6 = time.time()
         answer = generate_answer_strict(q, context, hits)
         t7 = time.time()
+        if matched_command and matched_command["intent"] == "compound":
+            return {
+                "transcript": transcript,
+                "query": q,
+                "intent": "compound",
+                "client_command": {
+                    "type": matched_command["type"],
+                },
+                "answer": build_compound_answer(matched_command["answer"], answer),
+                "context_used": (answer != REFUSAL),
+                "timing": {
+                    "asr": round(t1 - t0, 3),
+                    "audio_prepare": round(asr_stats["audio_prepare"], 3),
+                    "transcribe": round(asr_stats["transcribe"], 3),
+                    "normalize": round(t2 - t1, 3),
+                    "topic_check": round(t3 - t2, 3),
+                    "retrieve": round(t5 - t4, 3),
+                    "retrieve_embed": round(retrieve_stats["embed"], 3),
+                    "retrieve_search": round(retrieve_stats["search"], 3),
+                    "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
+                    "retrieve_context_build": round(retrieve_stats["context_build"], 3),
+                    "generate": round(t7 - t6, 3),
+                    "total": round(t7 - t0, 3),
+                },
+            }
         return {
             "transcript": transcript,
             "query": q,
@@ -478,8 +587,16 @@ def debug_command(req: QueryRequest):
 
     matched_command, command_debug = resolve_client_command(q)
     if matched_command:
-        result = command_response(q, matched_command["type"], matched_command["answer"])
-    elif command_debug["resolution"] == "unknown_command":
+        if matched_command["intent"] == "compound":
+            result = command_response(
+                q,
+                matched_command["type"],
+                "Запрос содержит и команду управления, и запрос на получение информации.",
+                intent="compound",
+            )
+        else:
+            result = command_response(q, matched_command["type"], matched_command["answer"])
+    elif command_debug["resolution"] in {"llm_unknown_command", "fallback_unknown_command"}:
         result = unknown_command_response(q)
     else:
         result = {

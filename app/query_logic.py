@@ -175,7 +175,8 @@ def classify_query_with_llm(query: str) -> dict | None:
         "Нужно отнести запрос ровно к одной категории:\n"
         "1. client_command — если пользователь хочет управлять 3D-моделью.\n"
         "2. knowledge_answer — если пользователь задаёт вопрос по знаниям о космическом аппарате.\n"
-        "3. unknown_command — если пользователь, вероятно, хочет управлять моделью, но команда не входит в допустимый список.\n"
+        "3. compound — если в одном запросе одновременно есть команда управления и просьба рассказать/объяснить что-то.\n"
+        "4. unknown_command — если пользователь, вероятно, хочет управлять моделью, но команда не входит в допустимый список.\n"
         f"Допустимые client_command: {allowed}.\n"
         "Смысл команд:\n"
         "- start_rotation: начать вращение, крутить, вертеть, повернуть, развернуть спутник или модель.\n"
@@ -189,6 +190,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         "Форматы ответа:\n"
         '{"intent":"client_command","command_type":"start_rotation"}\n'
         '{"intent":"knowledge_answer"}\n'
+        '{"intent":"compound","command_type":"play_animation"}\n'
         '{"intent":"unknown_command"}'
     )
     messages = [
@@ -235,6 +237,22 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "user",
+            "content": "Запусти анимацию и расскажи о спутнике",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"compound","command_type":"play_animation"}',
+        },
+        {
+            "role": "user",
+            "content": "Поверни модель и объясни, что это за антенна",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"compound","command_type":"start_rotation"}',
+        },
+        {
+            "role": "user",
             "content": "Что такое спутник?",
         },
         {
@@ -266,7 +284,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         return {"intent": "knowledge_answer"}
     if intent == "unknown_command":
         return {"intent": "unknown_command"}
-    if intent != "client_command":
+    if intent not in {"client_command", "compound"}:
         return None
 
     command_type = (parsed.get("command_type") or "").strip()
@@ -274,7 +292,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         return None
 
     return {
-        "intent": "client_command",
+        "intent": intent,
         "command_type": command_type,
     }
 
