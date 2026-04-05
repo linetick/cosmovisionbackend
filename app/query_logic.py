@@ -88,6 +88,12 @@ COMMAND_LIKE_MARKERS = (
 )
 COMMAND_TYPES = tuple(COMMAND_PHRASES.keys())
 
+KNOWLEDGE_REQUEST_MARKERS = (
+    "расскажи", "объясни", "что такое", "что это", "что за",
+    "для чего", "зачем", "как устро", "какой", "какая", "какие",
+    "что делает", "что умеет", "информация", "опиши",
+)
+
 
 def normalize_query(q: str) -> str:
     q = (q or "").strip()
@@ -128,6 +134,62 @@ def inject_spacecraft_context(query: str, current_spacecraft: str | None = None)
         return f"{q} {spacecraft}"
 
     return q
+
+
+def extract_knowledge_query_from_compound(
+    query: str,
+    command_type: str,
+    current_spacecraft: str | None = None,
+) -> str:
+    q = (query or "").strip()
+    if not q:
+        return q
+
+    current_spacecraft = (current_spacecraft or "").strip() or None
+    lowered = q.lower()
+
+    segments = [
+        part.strip(" ,.")
+        for part in re.split(r"\b(?:и|а|затем|потом)\b", q, flags=re.IGNORECASE)
+        if part.strip(" ,.")
+    ]
+
+    for segment in segments:
+        segment_lower = segment.lower()
+        if any(marker in segment_lower for marker in KNOWLEDGE_REQUEST_MARKERS):
+            extracted = segment.strip()
+            if current_spacecraft:
+                extracted = inject_spacecraft_context(extracted, current_spacecraft)
+            return extracted
+
+    command_phrases = COMMAND_PHRASES.get(command_type, ())
+    cleaned = q
+    for phrase in sorted(command_phrases, key=len, reverse=True):
+        cleaned = re.sub(
+            rf"\b{re.escape(phrase)}\b",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+    cleaned = re.sub(
+        r"\b(можешь|пожалуйста|давай|ну|текущий|текущего|текущую|текущее)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.")
+
+    if current_spacecraft:
+        cleaned = inject_spacecraft_context(cleaned, current_spacecraft)
+
+    if cleaned and any(marker in cleaned.lower() for marker in KNOWLEDGE_REQUEST_MARKERS):
+        return cleaned
+
+    if current_spacecraft:
+        return f"расскажи о спутнике {current_spacecraft}"
+
+    return "расскажи о спутнике"
 
 
 def is_off_topic(query: str) -> bool:
@@ -216,11 +278,14 @@ def classify_query_with_llm(query: str) -> dict | None:
         "- reset_view: сбросить вид, вернуть обратно, вернуть как было, исходный вид.\n"
         "- play_animation: запустить анимацию, включить движение, оживить, анимировать спутник.\n"
         "Учитывай разговорные формулировки, склонения слов, падежи и синонимы.\n"
+        "Если intent = knowledge_answer, обязательно верни поле knowledge_text.\n"
+        "Если intent = compound, обязательно верни поле knowledge_text и отдели из исходной фразы только информационную часть, без команды управления.\n"
+        "knowledge_text должен содержать только ту часть запроса, которую нужно отправить в retrieval/RAG.\n"
         "Верни только JSON без пояснений.\n"
         "Форматы ответа:\n"
         '{"intent":"client_command","command_type":"start_rotation"}\n'
-        '{"intent":"knowledge_answer"}\n'
-        '{"intent":"compound","command_type":"play_animation"}\n'
+        '{"intent":"knowledge_answer","knowledge_text":"что такое спутник"}\n'
+        '{"intent":"compound","command_type":"play_animation","knowledge_text":"расскажи о спутнике"}\n'
         '{"intent":"unknown_command"}'
     )
     messages = [
@@ -271,7 +336,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"compound","command_type":"play_animation"}',
+            "content": '{"intent":"compound","command_type":"play_animation","knowledge_text":"расскажи о спутнике"}',
         },
         {
             "role": "user",
@@ -279,7 +344,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"compound","command_type":"start_rotation"}',
+            "content": '{"intent":"compound","command_type":"start_rotation","knowledge_text":"объясни, что это за антенна"}',
         },
         {
             "role": "user",
@@ -287,7 +352,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"knowledge_answer"}',
+            "content": '{"intent":"knowledge_answer","knowledge_text":"что такое спутник"}',
         },
         {
             "role": "user",
@@ -311,7 +376,11 @@ def classify_query_with_llm(query: str) -> dict | None:
 
     intent = (parsed.get("intent") or "").strip()
     if intent == "knowledge_answer":
-        return {"intent": "knowledge_answer"}
+        knowledge_text = (parsed.get("knowledge_text") or "").strip()
+        return {
+            "intent": "knowledge_answer",
+            "knowledge_text": knowledge_text or query,
+        }
     if intent == "unknown_command":
         return {"intent": "unknown_command"}
     if intent not in {"client_command", "compound"}:
@@ -321,10 +390,14 @@ def classify_query_with_llm(query: str) -> dict | None:
     if command_type not in COMMAND_ANSWERS:
         return None
 
-    return {
+    route = {
         "intent": intent,
         "command_type": command_type,
     }
+    if intent == "compound":
+        knowledge_text = (parsed.get("knowledge_text") or "").strip()
+        route["knowledge_text"] = knowledge_text or ""
+    return route
 
 
 def clean_doc_keep_header(text: str) -> str:

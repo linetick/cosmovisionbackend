@@ -12,6 +12,7 @@ from .query_logic import (
     build_context_from_hits,
     classify_query_with_llm,
     detect_client_command,
+    extract_knowledge_query_from_compound,
     find_extractive_answer,
     generate_answer_llm_only,
     generate_answer_strict,
@@ -111,12 +112,16 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
                 "intent": "compound",
                 "type": llm_route["command_type"],
                 "answer": COMMAND_ANSWERS[llm_route["command_type"]],
+                "knowledge_text": (llm_route.get("knowledge_text") or "").strip() or None,
             }, debug
         if llm_route["intent"] == "unknown_command":
             debug["resolution"] = "llm_unknown_command"
-            return None, debug
+            return {"intent": "unknown_command"}, debug
         debug["resolution"] = "llm_knowledge_answer"
-        return None, debug
+        return {
+            "intent": "knowledge_answer",
+            "knowledge_text": (llm_route.get("knowledge_text") or "").strip() or query,
+        }, debug
 
     matched_command = detect_client_command(query)
     if matched_command:
@@ -132,10 +137,13 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
     debug["looks_like_command"] = looks_like
     if looks_like:
         debug["resolution"] = "fallback_unknown_command"
-        return None, debug
+        return {"intent": "unknown_command"}, debug
 
     debug["resolution"] = "fallback_knowledge_answer"
-    return None, debug
+    return {
+        "intent": "knowledge_answer",
+        "knowledge_text": query,
+    }, debug
 
 
 @app.post("/query")
@@ -174,7 +182,7 @@ def handle_query(req: QueryRequest):
             }
             return result
 
-        if command_debug["resolution"] in {"llm_unknown_command", "fallback_unknown_command"}:
+        if matched_command and matched_command["intent"] == "unknown_command":
             result = unknown_command_response(q)
             result["timing"] = {
                 "normalize": round(t1 - t0, 3),
@@ -182,7 +190,25 @@ def handle_query(req: QueryRequest):
             }
             return result
 
-        off_topic = is_off_topic(q)
+        knowledge_query = q
+        if matched_command and matched_command["intent"] == "compound":
+            knowledge_query = (matched_command.get("knowledge_text") or "").strip()
+            if not knowledge_query:
+                knowledge_query = extract_knowledge_query_from_compound(
+                    q,
+                    matched_command["type"],
+                    current_spacecraft=current_spacecraft,
+                )
+            else:
+                knowledge_query = normalize_query(knowledge_query)
+                if current_spacecraft:
+                    knowledge_query = inject_spacecraft_context(knowledge_query, current_spacecraft)
+        elif matched_command and matched_command["intent"] == "knowledge_answer":
+            knowledge_query = normalize_query((matched_command.get("knowledge_text") or "").strip() or q)
+            if current_spacecraft:
+                knowledge_query = inject_spacecraft_context(knowledge_query, current_spacecraft)
+
+        off_topic = is_off_topic(knowledge_query)
         t2 = time.time()
         if off_topic and not (matched_command and matched_command["intent"] == "compound"):
             return {
@@ -202,7 +228,7 @@ def handle_query(req: QueryRequest):
             }
 
         t3 = time.time()
-        context, hits, retrieve_stats = retrieve_context(q, initial_n=3, max_n=9)
+        context, hits, retrieve_stats = retrieve_context(knowledge_query, initial_n=3, max_n=9)
         t4 = time.time()
         if not context:
             if matched_command and matched_command["intent"] == "compound":
@@ -212,6 +238,7 @@ def handle_query(req: QueryRequest):
                     "client_command": {
                         "type": matched_command["type"],
                     },
+                    "knowledge_query": knowledge_query,
                     "answer": build_compound_answer(matched_command["answer"], REFUSAL),
                     "context_used": False,
                     "timing": {
@@ -244,7 +271,7 @@ def handle_query(req: QueryRequest):
             }
 
         t5 = time.time()
-        answer = generate_answer_strict(q, context, hits)
+        answer = generate_answer_strict(knowledge_query, context, hits)
         t6 = time.time()
         if matched_command and matched_command["intent"] == "compound":
             return {
@@ -253,6 +280,7 @@ def handle_query(req: QueryRequest):
                 "client_command": {
                     "type": matched_command["type"],
                 },
+                "knowledge_query": knowledge_query,
                 "answer": build_compound_answer(matched_command["answer"], answer),
                 "context_used": (answer != REFUSAL),
                 "timing": {
@@ -395,7 +423,7 @@ async def handle_query_audio(
             }
             return result
 
-        if command_debug["resolution"] in {"llm_unknown_command", "fallback_unknown_command"}:
+        if matched_command and matched_command["intent"] == "unknown_command":
             result = unknown_command_response(q)
             result["transcript"] = transcript
             result["timing"] = {
@@ -407,7 +435,25 @@ async def handle_query_audio(
             }
             return result
 
-        off_topic = is_off_topic(q)
+        knowledge_query = q
+        if matched_command and matched_command["intent"] == "compound":
+            knowledge_query = (matched_command.get("knowledge_text") or "").strip()
+            if not knowledge_query:
+                knowledge_query = extract_knowledge_query_from_compound(
+                    q,
+                    matched_command["type"],
+                    current_spacecraft=resolved_spacecraft,
+                )
+            else:
+                knowledge_query = normalize_query(knowledge_query)
+                if resolved_spacecraft:
+                    knowledge_query = inject_spacecraft_context(knowledge_query, resolved_spacecraft)
+        elif matched_command and matched_command["intent"] == "knowledge_answer":
+            knowledge_query = normalize_query((matched_command.get("knowledge_text") or "").strip() or q)
+            if resolved_spacecraft:
+                knowledge_query = inject_spacecraft_context(knowledge_query, resolved_spacecraft)
+
+        off_topic = is_off_topic(knowledge_query)
         t3 = time.time()
         if off_topic and not (matched_command and matched_command["intent"] == "compound"):
             return {
@@ -431,7 +477,7 @@ async def handle_query_audio(
             }
 
         t4 = time.time()
-        context, hits, retrieve_stats = retrieve_context(q, initial_n=3, max_n=9)
+        context, hits, retrieve_stats = retrieve_context(knowledge_query, initial_n=3, max_n=9)
         t5 = time.time()
         if not context:
             if matched_command and matched_command["intent"] == "compound":
@@ -442,6 +488,7 @@ async def handle_query_audio(
                     "client_command": {
                         "type": matched_command["type"],
                     },
+                    "knowledge_query": knowledge_query,
                     "answer": build_compound_answer(matched_command["answer"], REFUSAL),
                     "context_used": False,
                     "timing": {
@@ -481,7 +528,7 @@ async def handle_query_audio(
             }
 
         t6 = time.time()
-        answer = generate_answer_strict(q, context, hits)
+        answer = generate_answer_strict(knowledge_query, context, hits)
         t7 = time.time()
         if matched_command and matched_command["intent"] == "compound":
             return {
@@ -491,6 +538,7 @@ async def handle_query_audio(
                 "client_command": {
                     "type": matched_command["type"],
                 },
+                "knowledge_query": knowledge_query,
                 "answer": build_compound_answer(matched_command["answer"], answer),
                 "context_used": (answer != REFUSAL),
                 "timing": {
@@ -629,6 +677,12 @@ def debug_command(req: QueryRequest):
     raw = req.text or ""
     q = normalize_query(raw)
     t1 = time.time()
+    current_spacecraft = resolve_current_spacecraft(
+        current_model_id=req.current_model_id,
+        current_spacecraft=req.current_spacecraft,
+    )
+    if current_spacecraft:
+        q = inject_spacecraft_context(q, current_spacecraft)
 
     matched_command, command_debug = resolve_client_command(q)
     if matched_command:
@@ -639,10 +693,20 @@ def debug_command(req: QueryRequest):
                 "Запрос содержит и команду управления, и запрос на получение информации.",
                 intent="compound",
             )
-        else:
+            result["knowledge_text"] = matched_command.get("knowledge_text")
+        elif matched_command["intent"] == "client_command":
             result = command_response(q, matched_command["type"], matched_command["answer"])
-    elif command_debug["resolution"] in {"llm_unknown_command", "fallback_unknown_command"}:
-        result = unknown_command_response(q)
+        elif matched_command["intent"] == "unknown_command":
+            result = unknown_command_response(q)
+        else:
+            result = {
+                "query": q,
+                "intent": "knowledge_answer",
+                "client_command": None,
+                "answer": "Запрос не классифицирован как команда управления.",
+                "context_used": False,
+                "knowledge_text": matched_command.get("knowledge_text"),
+            }
     else:
         result = {
             "query": q,
