@@ -177,21 +177,85 @@ def classify_query_with_llm(query: str) -> dict | None:
         "2. knowledge_answer — если пользователь задаёт вопрос по знаниям о космическом аппарате.\n"
         "3. unknown_command — если пользователь, вероятно, хочет управлять моделью, но команда не входит в допустимый список.\n"
         f"Допустимые client_command: {allowed}.\n"
+        "Смысл команд:\n"
+        "- start_rotation: начать вращение, крутить, вертеть, повернуть, развернуть спутник или модель.\n"
+        "- stop_rotation: остановить вращение, прекратить кручение, перестать вращать, остановить спутник.\n"
+        "- increase_scale: увеличить, приблизить, сделать больше модель или спутник.\n"
+        "- decrease_scale: уменьшить, отдалить, сделать меньше модель или спутник.\n"
+        "- reset_view: сбросить вид, вернуть обратно, вернуть как было, исходный вид.\n"
+        "- play_animation: запустить анимацию, включить движение, оживить, анимировать спутник.\n"
+        "Учитывай разговорные формулировки, склонения слов, падежи и синонимы.\n"
         "Верни только JSON без пояснений.\n"
         "Форматы ответа:\n"
         '{"intent":"client_command","command_type":"start_rotation"}\n'
         '{"intent":"knowledge_answer"}\n'
         '{"intent":"unknown_command"}'
     )
-    user = f"Запрос пользователя: {query}"
+    messages = [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": "Покрути спутник",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"client_command","command_type":"start_rotation"}',
+        },
+        {
+            "role": "user",
+            "content": "Останови вращение текущего спутника",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"client_command","command_type":"stop_rotation"}',
+        },
+        {
+            "role": "user",
+            "content": "Сделай модель больше",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"client_command","command_type":"increase_scale"}',
+        },
+        {
+            "role": "user",
+            "content": "Верни как было",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"client_command","command_type":"reset_view"}',
+        },
+        {
+            "role": "user",
+            "content": "Запусти анимацию спутника",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"client_command","command_type":"play_animation"}',
+        },
+        {
+            "role": "user",
+            "content": "Что такое спутник?",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"knowledge_answer"}',
+        },
+        {
+            "role": "user",
+            "content": "Сделай что-нибудь со спутником",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"unknown_command"}',
+        },
+        {
+            "role": "user",
+            "content": query,
+        },
+    ]
 
-    raw = run_chat_generation(
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        max_new_tokens=SHORT_LLM_MAX_NEW_TOKENS,
-    )
+    raw = run_chat_generation(messages, max_new_tokens=SHORT_LLM_MAX_NEW_TOKENS)
 
     parsed = _extract_json_object(raw)
     if not parsed:
