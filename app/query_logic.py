@@ -41,6 +41,50 @@ from .runtime import (
     tokenizer,
 )
 
+COMMAND_PHRASES = {
+    "start_rotation": (
+        "вращай", "повращай", "крути", "покрути", "начни вращение",
+        "запусти вращение", "вращение", "верти", "заверти",
+    ),
+    "stop_rotation": (
+        "останови вращение", "останови спутник", "не вращай", "хватит вращать",
+        "перестань вращать", "стоп", "остановись", "остановка",
+    ),
+    "increase_scale": (
+        "увеличь", "увеличить", "приблизь", "сделай больше",
+        "увеличь спутник", "увеличь модель", "приблизи",
+    ),
+    "decrease_scale": (
+        "уменьши", "уменьшить", "отдали", "сделай меньше",
+        "уменьши спутник", "уменьши модель",
+    ),
+    "reset_view": (
+        "сбрось", "сброс", "верни обратно", "исходный вид",
+        "верни как было", "сбрось спутник", "сбрось модель",
+    ),
+    "play_animation": (
+        "запусти анимацию", "включи анимацию", "анимация", "оживи спутник",
+        "анимируй спутник", "запусти движение", "включи движение",
+    ),
+}
+
+COMMAND_ANSWERS = {
+    "start_rotation": "Запускаю вращение спутника.",
+    "stop_rotation": "Останавливаю вращение спутника.",
+    "increase_scale": "Увеличиваю модель.",
+    "decrease_scale": "Уменьшаю модель.",
+    "reset_view": "Возвращаю исходный вид модели.",
+    "play_animation": "Запускаю анимацию спутника.",
+}
+
+COMMAND_LIKE_MARKERS = (
+    "вращ", "крут", "верт", "останов", "стоп",
+    "увелич", "приблиз", "уменьш", "отдал",
+    "сброс", "верни обратно", "исходный вид",
+    "анимац", "анимир", "оживи", "движени",
+)
+COMMAND_TYPES = tuple(COMMAND_PHRASES.keys())
+
 
 def normalize_query(q: str) -> str:
     q = (q or "").strip()
@@ -71,6 +115,92 @@ def is_off_topic(query: str) -> bool:
         "датчик", "камера", "телеметр",
     ]
     return not any(k in q for k in on_topic)
+
+
+def _matches_any(text: str, phrases: tuple[str, ...]) -> bool:
+    normalized_text = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    normalized = f" {normalized_text} "
+    for phrase in phrases:
+        candidate_text = re.sub(r"\s+", " ", phrase.lower()).strip()
+        candidate = f" {candidate_text} "
+        if candidate in normalized:
+            return True
+    return False
+
+
+def detect_client_command(query: str) -> dict | None:
+    for command_type, phrases in COMMAND_PHRASES.items():
+        if _matches_any(query, phrases):
+            return {
+                "type": command_type,
+                "answer": COMMAND_ANSWERS[command_type],
+            }
+    return None
+
+
+def looks_like_client_command(query: str) -> bool:
+    lowered = (query or "").lower()
+    return any(marker in lowered for marker in COMMAND_LIKE_MARKERS)
+
+
+def _extract_json_object(text: str) -> dict | None:
+    if not text:
+        return None
+
+    candidate = text.strip()
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def classify_client_command_with_llm(query: str) -> dict | None:
+    allowed = ", ".join(COMMAND_TYPES)
+    system = (
+        "Ты классификатор пользовательских команд для AR-приложения.\n"
+        "Нужно выбрать только одну из допустимых команд или вернуть unknown_command.\n"
+        f"Допустимые команды: {allowed}.\n"
+        "Верни только JSON без пояснений в одном из двух форматов:\n"
+        '{"intent":"client_command","command_type":"start_rotation"}\n'
+        '{"intent":"unknown_command"}'
+    )
+    user = f"Запрос пользователя: {query}"
+
+    raw = run_chat_generation(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        max_new_tokens=SHORT_LLM_MAX_NEW_TOKENS,
+    )
+
+    parsed = _extract_json_object(raw)
+    if not parsed:
+        return None
+
+    intent = (parsed.get("intent") or "").strip()
+    if intent != "client_command":
+        return None
+
+    command_type = (parsed.get("command_type") or "").strip()
+    if command_type not in COMMAND_ANSWERS:
+        return None
+
+    return {
+        "type": command_type,
+        "answer": COMMAND_ANSWERS[command_type],
+    }
 
 
 def clean_doc_keep_header(text: str) -> str:
