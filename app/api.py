@@ -14,6 +14,7 @@ from .query_logic import (
     detect_client_command,
     extract_knowledge_query_from_compound,
     find_extractive_answer,
+    generate_answer_compact,
     generate_answer_llm_only,
     generate_answer_strict,
     has_sufficient_context_relevance,
@@ -302,7 +303,10 @@ def handle_query(req: QueryRequest):
             }
 
         t5 = time.time()
-        answer = generate_answer_strict(knowledge_query, context, hits)
+        if matched_command and matched_command["intent"] == "compound":
+            answer = generate_answer_compact(knowledge_query, context, hits)
+        else:
+            answer = generate_answer_strict(knowledge_query, context, hits)
         t6 = time.time()
         if matched_command and matched_command["intent"] == "compound":
             return {
@@ -559,7 +563,10 @@ async def handle_query_audio(
             }
 
         t6 = time.time()
-        answer = generate_answer_strict(knowledge_query, context, hits)
+        if matched_command and matched_command["intent"] == "compound":
+            answer = generate_answer_compact(knowledge_query, context, hits)
+        else:
+            answer = generate_answer_strict(knowledge_query, context, hits)
         t7 = time.time()
         if matched_command and matched_command["intent"] == "compound":
             return {

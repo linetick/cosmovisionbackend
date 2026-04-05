@@ -906,6 +906,57 @@ def generate_answer_strict(query: str, context: str, hits: list[dict] | None = N
     return squeeze_to_one_sentence(text) if brief_answer else text
 
 
+def generate_answer_compact(query: str, context: str, hits: list[dict] | None = None) -> str:
+    if is_definitional(query):
+        defin = extract_definition_from_context(query, context)
+        if defin:
+            return squeeze_to_one_sentence(defin)
+
+    extractive = find_extractive_answer(query, hits or [])
+    if extractive:
+        return squeeze_to_one_sentence(extractive)
+
+    if not context.strip():
+        return REFUSAL
+
+    if hits:
+        shorter_context = build_context_from_hits(hits, max_chars=SHORT_RAG_MAX_CONTEXT_CHARS)
+        if shorter_context:
+            context = shorter_context
+
+    relevant, _ = has_sufficient_context_relevance(query, context)
+    if not relevant:
+        return REFUSAL
+
+    system = (
+        "Ты — ИИ-ассистент по космонавтике с RAG.\n"
+        "Отвечай только по фрагментам базы знаний из блока КОНТЕКСТ.\n"
+        "Нельзя добавлять факты не из контекста.\n"
+        "Ответ должен быть кратким: одно короткое содержательное предложение без вводных слов.\n"
+        f"Если в контексте нет ответа, верни ровно: {REFUSAL}"
+    )
+
+    user_content = (
+        f"КОНТЕКСТ:\n{context}\n\n"
+        f"ВОПРОС: {query}\n\n"
+        "Ответь одним коротким предложением."
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+
+    text = run_chat_generation(messages, SHORT_LLM_MAX_NEW_TOKENS)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^ответ:\s*", "", text, flags=re.IGNORECASE)
+    if not text or len(text) < 3:
+        return REFUSAL
+    if is_refusal_like(text):
+        return REFUSAL
+    return squeeze_to_one_sentence(text)
+
+
 def wav_to_16k_mono_wav_bytes(wav_bytes: bytes) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fin:
         fin.write(wav_bytes)
