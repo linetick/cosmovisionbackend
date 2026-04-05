@@ -1,7 +1,7 @@
 import os
 import time
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -16,6 +16,7 @@ from .query_logic import (
     generate_answer_llm_only,
     generate_answer_strict,
     has_sufficient_context_relevance,
+    inject_spacecraft_context,
     is_off_topic,
     looks_like_client_command,
     normalize_query,
@@ -28,6 +29,8 @@ from .runtime import collection, warmup
 
 class QueryRequest(BaseModel):
     text: str
+    current_model_id: str | None = None
+    current_spacecraft: str | None = None
 
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
@@ -61,6 +64,26 @@ def build_compound_answer(command_answer: str, knowledge_answer: str) -> str:
     if not knowledge_answer or knowledge_answer == REFUSAL:
         return f"{command_answer} {REFUSAL}"
     return f"{command_answer} {knowledge_answer}"
+
+
+def resolve_current_spacecraft(
+    current_model_id: str | None = None,
+    current_spacecraft: str | None = None,
+) -> str | None:
+    spacecraft = (current_spacecraft or "").strip()
+    if spacecraft:
+        return spacecraft
+
+    model_id = (current_model_id or "").strip()
+    if not model_id:
+        return None
+
+    item = get_model_metadata(model_id)
+    if not item:
+        return None
+
+    spacecraft = (item.get("spacecraft") or item.get("name") or "").strip()
+    return spacecraft or None
 
 
 def resolve_client_command(query: str) -> tuple[dict | None, dict]:
@@ -122,6 +145,12 @@ def handle_query(req: QueryRequest):
         raw = req.text or ""
         q = normalize_query(raw)
         t1 = time.time()
+        current_spacecraft = resolve_current_spacecraft(
+            current_model_id=req.current_model_id,
+            current_spacecraft=req.current_spacecraft,
+        )
+        if current_spacecraft:
+            q = inject_spacecraft_context(q, current_spacecraft)
 
         if not q:
             return {
@@ -267,6 +296,12 @@ def handle_query_llm_only(req: QueryRequest):
         raw = req.text or ""
         q = normalize_query(raw)
         t1 = time.time()
+        current_spacecraft = resolve_current_spacecraft(
+            current_model_id=req.current_model_id,
+            current_spacecraft=req.current_spacecraft,
+        )
+        if current_spacecraft:
+            q = inject_spacecraft_context(q, current_spacecraft)
 
         if not q:
             return {
@@ -303,7 +338,11 @@ def handle_query_llm_only(req: QueryRequest):
 
 
 @app.post("/query_audio")
-async def handle_query_audio(file: UploadFile = File(...)):
+async def handle_query_audio(
+    file: UploadFile = File(...),
+    current_model_id: str | None = Form(None),
+    current_spacecraft: str | None = Form(None),
+):
     try:
         audio_bytes = await file.read()
         if not audio_bytes:
@@ -320,6 +359,12 @@ async def handle_query_audio(file: UploadFile = File(...)):
         t1 = time.time()
         q = normalize_query(transcript)
         t2 = time.time()
+        resolved_spacecraft = resolve_current_spacecraft(
+            current_model_id=current_model_id,
+            current_spacecraft=current_spacecraft,
+        )
+        if resolved_spacecraft:
+            q = inject_spacecraft_context(q, resolved_spacecraft)
 
         if not q:
             return {

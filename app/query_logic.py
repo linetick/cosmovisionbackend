@@ -100,6 +100,36 @@ def normalize_query(q: str) -> str:
     return q
 
 
+def inject_spacecraft_context(query: str, current_spacecraft: str | None = None) -> str:
+    q = (query or "").strip()
+    spacecraft = (current_spacecraft or "").strip()
+    if not q or not spacecraft:
+        return q
+
+    lowered = q.lower()
+    if spacecraft.lower() in lowered:
+        return q
+
+    ambiguous_markers = (
+        "о спутнике",
+        "про спутник",
+        "про спутнике",
+        "о нем",
+        "о нём",
+        "про него",
+        "расскажи о спутнике",
+        "расскажи про спутник",
+        "объясни про спутник",
+        "расскажи о нем",
+        "расскажи о нём",
+        "что это за спутник",
+    )
+    if any(marker in lowered for marker in ambiguous_markers):
+        return f"{q} {spacecraft}"
+
+    return q
+
+
 def is_off_topic(query: str) -> bool:
     q = query.lower()
     personal = [
