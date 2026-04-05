@@ -88,10 +88,25 @@ COMMAND_LIKE_MARKERS = (
 )
 COMMAND_TYPES = tuple(COMMAND_PHRASES.keys())
 
+COMMAND_MARKER_GROUPS = (
+    ("stop_rotation", ("останов", "перестан", "не вращ", "хватит вращ", "стоп")),
+    ("play_animation", ("анимац", "анимир", "ожив", "включи движение", "запусти движение")),
+    ("increase_scale", ("увелич", "приблиз", "больше")),
+    ("decrease_scale", ("уменьш", "отдал", "меньше")),
+    ("reset_view", ("сброс", "исходный вид", "верни обратно", "как было")),
+    ("start_rotation", ("вращ", "крут", "верт", "поверн", "разверн")),
+)
+
 KNOWLEDGE_REQUEST_MARKERS = (
     "расскажи", "объясни", "что такое", "что это", "что за",
     "для чего", "зачем", "как устро", "какой", "какая", "какие",
     "что делает", "что умеет", "информация", "опиши",
+)
+
+KNOWLEDGE_REQUEST_STEMS = (
+    "расскаж", "объясн", "что такое", "что это", "что за",
+    "для чего", "зачем", "как устро", "какой", "какая", "какие",
+    "что делает", "что умеет", "информац", "опиш",
 )
 
 
@@ -238,6 +253,19 @@ def looks_like_client_command(query: str) -> bool:
     return any(marker in lowered for marker in COMMAND_LIKE_MARKERS)
 
 
+def infer_client_command_from_markers(query: str) -> str | None:
+    lowered = (query or "").lower()
+    for command_type, markers in COMMAND_MARKER_GROUPS:
+        if any(marker in lowered for marker in markers):
+            return command_type
+    return None
+
+
+def looks_like_knowledge_request(query: str) -> bool:
+    lowered = (query or "").lower()
+    return any(marker in lowered for marker in KNOWLEDGE_REQUEST_STEMS)
+
+
 def _extract_json_object(text: str) -> dict | None:
     if not text:
         return None
@@ -264,6 +292,9 @@ def classify_query_with_llm(query: str) -> dict | None:
     allowed = ", ".join(COMMAND_TYPES)
     system = (
         "Ты маршрутизатор запросов для AR-приложения про космические аппараты.\n"
+        "Нужно отнести запрос ровно к одной категории и вернуть только JSON.\n"
+        "Считай, что пользователь часто пишет разговорно, с лишними словами, вежливыми оборотами и смешивает несколько действий в одном предложении.\n"
+        "Твоя задача не ответить пользователю, а только разобрать запрос по смыслу.\n"
         "Нужно отнести запрос ровно к одной категории:\n"
         "1. client_command — если пользователь хочет управлять 3D-моделью.\n"
         "2. knowledge_answer — если пользователь задаёт вопрос по знаниям о космическом аппарате.\n"
@@ -278,6 +309,13 @@ def classify_query_with_llm(query: str) -> dict | None:
         "- reset_view: сбросить вид, вернуть обратно, вернуть как было, исходный вид.\n"
         "- play_animation: запустить анимацию, включить движение, оживить, анимировать спутник.\n"
         "Учитывай разговорные формулировки, склонения слов, падежи и синонимы.\n"
+        "Очень важные правила выбора intent:\n"
+        "- Если в запросе есть понятная команда из допустимого списка и больше ничего, выбирай client_command.\n"
+        "- Если в запросе есть понятная команда из допустимого списка и одновременно просьба рассказать, объяснить, описать, что это такое или для чего это нужно, выбирай compound.\n"
+        "- Если в запросе есть слова 'можешь', 'пожалуйста', 'и', 'а ещё', 'текущий', название спутника или другие лишние слова, это не меняет intent.\n"
+        "- Не выбирай unknown_command, если по смыслу запрос можно отнести к одной из допустимых команд.\n"
+        "- unknown_command выбирай только тогда, когда пользователь явно хочет управлять моделью, но команда семантически не соответствует ни одной допустимой команде.\n"
+        "- Если запрос смешанный, в knowledge_text оставляй только информационную часть без команды управления.\n"
         "Если intent = knowledge_answer, обязательно верни поле knowledge_text.\n"
         "Если intent = compound, обязательно верни поле knowledge_text и отдели из исходной фразы только информационную часть, без команды управления.\n"
         "knowledge_text должен содержать только ту часть запроса, которую нужно отправить в retrieval/RAG.\n"
@@ -332,11 +370,35 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "user",
+            "content": "Можешь запустить анимацию текущего спутника",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"client_command","command_type":"play_animation"}',
+        },
+        {
+            "role": "user",
             "content": "Запусти анимацию и расскажи о спутнике",
         },
         {
             "role": "assistant",
             "content": '{"intent":"compound","command_type":"play_animation","knowledge_text":"расскажи о спутнике"}',
+        },
+        {
+            "role": "user",
+            "content": "Можешь запустить анимацию и рассказать о спутнике Метеор-М",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"compound","command_type":"play_animation","knowledge_text":"расскажи о спутнике Метеор-М"}',
+        },
+        {
+            "role": "user",
+            "content": "Останови вращение и объясни, что это за антенна",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"compound","command_type":"stop_rotation","knowledge_text":"объясни, что это за антенна"}',
         },
         {
             "role": "user",
@@ -353,6 +415,14 @@ def classify_query_with_llm(query: str) -> dict | None:
         {
             "role": "assistant",
             "content": '{"intent":"knowledge_answer","knowledge_text":"что такое спутник"}',
+        },
+        {
+            "role": "user",
+            "content": "Расскажи о Метеор-М",
+        },
+        {
+            "role": "assistant",
+            "content": '{"intent":"knowledge_answer","knowledge_text":"расскажи о Метеор-М"}',
         },
         {
             "role": "user",

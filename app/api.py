@@ -17,8 +17,10 @@ from .query_logic import (
     generate_answer_llm_only,
     generate_answer_strict,
     has_sufficient_context_relevance,
+    infer_client_command_from_markers,
     inject_spacecraft_context,
     is_off_topic,
+    looks_like_knowledge_request,
     looks_like_client_command,
     normalize_query,
     retrieve_context,
@@ -92,6 +94,7 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
         "normalized_query": query,
         "llm_route": None,
         "rule_match": None,
+        "marker_match": None,
         "looks_like_command": False,
         "resolution": "knowledge_answer",
     }
@@ -115,8 +118,36 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
                 "knowledge_text": (llm_route.get("knowledge_text") or "").strip() or None,
             }, debug
         if llm_route["intent"] == "unknown_command":
+            marker_command = infer_client_command_from_markers(query)
+            debug["marker_match"] = marker_command
+            if marker_command and looks_like_knowledge_request(query):
+                debug["resolution"] = "llm_unknown_to_fallback_compound"
+                return {
+                    "intent": "compound",
+                    "type": marker_command,
+                    "answer": COMMAND_ANSWERS[marker_command],
+                    "knowledge_text": None,
+                }, debug
+            if marker_command:
+                debug["resolution"] = "llm_unknown_to_fallback_command"
+                return {
+                    "intent": "client_command",
+                    "type": marker_command,
+                    "answer": COMMAND_ANSWERS[marker_command],
+                }, debug
             debug["resolution"] = "llm_unknown_command"
             return {"intent": "unknown_command"}, debug
+
+        marker_command = infer_client_command_from_markers(query)
+        debug["marker_match"] = marker_command
+        if marker_command and looks_like_knowledge_request(query):
+            debug["resolution"] = "llm_knowledge_to_fallback_compound"
+            return {
+                "intent": "compound",
+                "type": marker_command,
+                "answer": COMMAND_ANSWERS[marker_command],
+                "knowledge_text": (llm_route.get("knowledge_text") or "").strip() or None,
+            }, debug
         debug["resolution"] = "llm_knowledge_answer"
         return {
             "intent": "knowledge_answer",
