@@ -80,6 +80,7 @@ def _normalize_record(record: dict) -> dict | None:
         "relative_path": relative_path,
         "size_bytes": stat.st_size,
         "download_url": f"/models/{model_id}/download",
+        "scene": record.get("scene") if isinstance(record.get("scene"), dict) else None,
     }
 
 

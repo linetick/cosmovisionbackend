@@ -26,6 +26,12 @@ from .config import (
     VLLM_BASE_URL,
     VLLM_MODEL,
     VLLM_TIMEOUT,
+    YANDEX_API_KEY,
+    YANDEX_BASE_URL,
+    YANDEX_MODEL,
+    YANDEX_PROJECT_ID,
+    YANDEX_PROMPT_ID,
+    YANDEX_TIMEOUT,
     WEAK_QUERY_TOKENS,
     WHISPER_BEAM_SIZE,
     WHISPER_VAD_FILTER,
@@ -296,11 +302,11 @@ def classify_query_with_llm(query: str) -> dict | None:
         "Считай, что пользователь часто пишет разговорно, с лишними словами, вежливыми оборотами и смешивает несколько действий в одном предложении.\n"
         "Твоя задача не ответить пользователю, а только разобрать запрос по смыслу.\n"
         "Нужно отнести запрос ровно к одной категории:\n"
-        "1. client_command — если пользователь хочет управлять 3D-моделью.\n"
-        "2. knowledge_answer — если пользователь задаёт вопрос по знаниям о космическом аппарате.\n"
-        "3. compound — если в одном запросе одновременно есть команда управления и просьба рассказать/объяснить что-то.\n"
+        "1. action — если пользователь хочет управлять 3D-моделью.\n"
+        "2. info — если пользователь задаёт вопрос по знаниям о космическом аппарате.\n"
+        "3. hybrid — если в одном запросе одновременно есть команда управления и просьба рассказать/объяснить что-то.\n"
         "4. unknown_command — если пользователь, вероятно, хочет управлять моделью, но команда не входит в допустимый список.\n"
-        f"Допустимые client_command: {allowed}.\n"
+        f"Допустимые action-команды: {allowed}.\n"
         "Смысл команд:\n"
         "- start_rotation: начать вращение, крутить, вертеть, повернуть, развернуть спутник или модель.\n"
         "- stop_rotation: остановить вращение, прекратить кручение, перестать вращать, остановить спутник.\n"
@@ -310,20 +316,20 @@ def classify_query_with_llm(query: str) -> dict | None:
         "- play_animation: запустить анимацию, включить движение, оживить, анимировать спутник.\n"
         "Учитывай разговорные формулировки, склонения слов, падежи и синонимы.\n"
         "Очень важные правила выбора intent:\n"
-        "- Если в запросе есть понятная команда из допустимого списка и больше ничего, выбирай client_command.\n"
-        "- Если в запросе есть понятная команда из допустимого списка и одновременно просьба рассказать, объяснить, описать, что это такое или для чего это нужно, выбирай compound.\n"
+        "- Если в запросе есть понятная команда из допустимого списка и больше ничего, выбирай action.\n"
+        "- Если в запросе есть понятная команда из допустимого списка и одновременно просьба рассказать, объяснить, описать, что это такое или для чего это нужно, выбирай hybrid.\n"
         "- Если в запросе есть слова 'можешь', 'пожалуйста', 'и', 'а ещё', 'текущий', название спутника или другие лишние слова, это не меняет intent.\n"
         "- Не выбирай unknown_command, если по смыслу запрос можно отнести к одной из допустимых команд.\n"
         "- unknown_command выбирай только тогда, когда пользователь явно хочет управлять моделью, но команда семантически не соответствует ни одной допустимой команде.\n"
         "- Если запрос смешанный, в knowledge_text оставляй только информационную часть без команды управления.\n"
-        "Если intent = knowledge_answer, обязательно верни поле knowledge_text.\n"
-        "Если intent = compound, обязательно верни поле knowledge_text и отдели из исходной фразы только информационную часть, без команды управления.\n"
+        "Если intent = info, обязательно верни поле knowledge_text.\n"
+        "Если intent = hybrid, обязательно верни поле knowledge_text и отдели из исходной фразы только информационную часть, без команды управления.\n"
         "knowledge_text должен содержать только ту часть запроса, которую нужно отправить в retrieval/RAG.\n"
         "Верни только JSON без пояснений.\n"
         "Форматы ответа:\n"
-        '{"intent":"client_command","command_type":"start_rotation"}\n'
-        '{"intent":"knowledge_answer","knowledge_text":"что такое спутник"}\n'
-        '{"intent":"compound","command_type":"play_animation","knowledge_text":"расскажи о спутнике"}\n'
+        '{"intent":"action","command_type":"start_rotation"}\n'
+        '{"intent":"info","knowledge_text":"что такое спутник"}\n'
+        '{"intent":"hybrid","command_type":"play_animation","knowledge_text":"расскажи о спутнике"}\n'
         '{"intent":"unknown_command"}'
     )
     messages = [
@@ -334,7 +340,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"client_command","command_type":"start_rotation"}',
+            "content": '{"intent":"action","command_type":"start_rotation"}',
         },
         {
             "role": "user",
@@ -342,7 +348,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"client_command","command_type":"stop_rotation"}',
+            "content": '{"intent":"action","command_type":"stop_rotation"}',
         },
         {
             "role": "user",
@@ -350,7 +356,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"client_command","command_type":"increase_scale"}',
+            "content": '{"intent":"action","command_type":"increase_scale"}',
         },
         {
             "role": "user",
@@ -358,7 +364,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"client_command","command_type":"reset_view"}',
+            "content": '{"intent":"action","command_type":"reset_view"}',
         },
         {
             "role": "user",
@@ -366,7 +372,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"client_command","command_type":"play_animation"}',
+            "content": '{"intent":"action","command_type":"play_animation"}',
         },
         {
             "role": "user",
@@ -374,7 +380,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"client_command","command_type":"play_animation"}',
+            "content": '{"intent":"action","command_type":"play_animation"}',
         },
         {
             "role": "user",
@@ -382,7 +388,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"compound","command_type":"play_animation","knowledge_text":"расскажи о спутнике"}',
+            "content": '{"intent":"hybrid","command_type":"play_animation","knowledge_text":"расскажи о спутнике"}',
         },
         {
             "role": "user",
@@ -390,7 +396,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"compound","command_type":"play_animation","knowledge_text":"расскажи о спутнике Метеор-М"}',
+            "content": '{"intent":"hybrid","command_type":"play_animation","knowledge_text":"расскажи о спутнике Метеор-М"}',
         },
         {
             "role": "user",
@@ -398,7 +404,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"compound","command_type":"stop_rotation","knowledge_text":"объясни, что это за антенна"}',
+            "content": '{"intent":"hybrid","command_type":"stop_rotation","knowledge_text":"объясни, что это за антенна"}',
         },
         {
             "role": "user",
@@ -406,7 +412,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"compound","command_type":"start_rotation","knowledge_text":"объясни, что это за антенна"}',
+            "content": '{"intent":"hybrid","command_type":"start_rotation","knowledge_text":"объясни, что это за антенна"}',
         },
         {
             "role": "user",
@@ -414,7 +420,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"knowledge_answer","knowledge_text":"что такое спутник"}',
+            "content": '{"intent":"info","knowledge_text":"что такое спутник"}',
         },
         {
             "role": "user",
@@ -422,7 +428,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
         {
             "role": "assistant",
-            "content": '{"intent":"knowledge_answer","knowledge_text":"расскажи о Метеор-М"}',
+            "content": '{"intent":"info","knowledge_text":"расскажи о Метеор-М"}',
         },
         {
             "role": "user",
@@ -445,15 +451,15 @@ def classify_query_with_llm(query: str) -> dict | None:
         return None
 
     intent = (parsed.get("intent") or "").strip()
-    if intent == "knowledge_answer":
+    if intent == "info":
         knowledge_text = (parsed.get("knowledge_text") or "").strip()
         return {
-            "intent": "knowledge_answer",
+            "intent": "info",
             "knowledge_text": knowledge_text or query,
         }
     if intent == "unknown_command":
         return {"intent": "unknown_command"}
-    if intent not in {"client_command", "compound"}:
+    if intent not in {"action", "hybrid"}:
         return None
 
     command_type = (parsed.get("command_type") or "").strip()
@@ -464,7 +470,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         "intent": intent,
         "command_type": command_type,
     }
-    if intent == "compound":
+    if intent == "hybrid":
         knowledge_text = (parsed.get("knowledge_text") or "").strip()
         route["knowledge_text"] = knowledge_text or ""
     return route
@@ -802,9 +808,94 @@ def generate_with_vllm(messages: list[dict], max_new_tokens: int) -> str:
     return (message.get("content") or "").strip()
 
 
-def run_chat_generation(messages: list[dict], max_new_tokens: int) -> str:
+def _normalize_yandex_input(messages: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for message in messages:
+        role = (message.get("role") or "user").strip() or "user"
+        content = message.get("content") or ""
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = (item.get("text") or "").strip()
+                    if text:
+                        text_parts.append(text)
+                elif isinstance(item, str):
+                    text = item.strip()
+                    if text:
+                        text_parts.append(text)
+            content = "\n".join(text_parts).strip()
+        else:
+            content = str(content).strip()
+        if not content:
+            continue
+        normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def _extract_yandex_output_text(body: dict) -> str:
+    output = body.get("output") or []
+    for item in output:
+        if item.get("type") != "message":
+            continue
+        contents = item.get("content") or []
+        text_parts = []
+        for part in contents:
+            if part.get("type") == "output_text":
+                text = (part.get("text") or "").strip()
+                if text:
+                    text_parts.append(text)
+        if text_parts:
+            return "\n".join(text_parts).strip()
+    return ""
+
+
+def generate_with_yandex(messages: list[dict], max_new_tokens: int, prompt_id: str | None = None) -> str:
+    if not YANDEX_API_KEY:
+        raise RuntimeError("YANDEX_API_KEY не задан.")
+    if not YANDEX_PROJECT_ID:
+        raise RuntimeError("YANDEX_PROJECT_ID не задан.")
+
+    effective_prompt_id = prompt_id if prompt_id is not None else YANDEX_PROMPT_ID
+
+    payload: dict = {
+        "input": _normalize_yandex_input(messages),
+        "temperature": 0,
+        "max_output_tokens": max_new_tokens,
+    }
+
+    if effective_prompt_id:
+        payload["prompt"] = {"id": effective_prompt_id}
+    else:
+        payload["model"] = f"gpt://{YANDEX_PROJECT_ID}/{YANDEX_MODEL}"
+
+    request = urllib.request.Request(
+        f"{YANDEX_BASE_URL}/responses",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {YANDEX_API_KEY}",
+            "OpenAI-Project": YANDEX_PROJECT_ID,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=YANDEX_TIMEOUT) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Yandex Cloud HTTP {exc.code}: {detail}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Yandex Cloud request failed: {exc}") from exc
+
+    return _extract_yandex_output_text(body)
+
+
+def run_chat_generation(messages: list[dict], max_new_tokens: int, prompt_id: str | None = None) -> str:
     if LLM_BACKEND == "vllm":
         return generate_with_vllm(messages, max_new_tokens)
+    if LLM_BACKEND == "yandex":
+        return generate_with_yandex(messages, max_new_tokens, prompt_id=prompt_id)
 
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(

@@ -6,6 +6,100 @@
     "spacecraft": "Спутник-1",
     "format": "fbx",
     "file_name": "Sputnik-1.fbx",
-    "relative_path": "Sputnik-1.fbx"
+    "relative_path": "Sputnik-1.fbx",
+    "scene": {
+      "root_node": "Sputnik-1001",
+      "entities": {
+        "satellite": {
+          "nodes": [
+            "Sputnik-1001"
+          ],
+          "aliases": [
+            "спутник",
+            "аппарат",
+            "спутник-1",
+            "корпус спутника"
+          ]
+        },
+        "antenna": {
+          "nodes": [
+            "Bone_Antenna 1",
+            "Bone_Antenna 2",
+            "Bone_Antenna 3",
+            "Bone_Antenna 4"
+          ],
+          "aliases": [
+            "антенна",
+            "антенны",
+            "ус",
+            "усы"
+          ]
+        },
+        "battery": {
+          "nodes": [
+            "Bone_Battery"
+          ],
+          "aliases": [
+            "батарея",
+            "аккумулятор",
+            "источник питания"
+          ]
+        },
+        "fan": {
+          "nodes": [
+            "Bone_Fan"
+          ],
+          "aliases": [
+            "вентилятор",
+            "крыльчатка"
+          ]
+        },
+        "protective_screen": {
+          "nodes": [
+            "Bone_ProtectiveScreen"
+          ],
+          "aliases": [
+            "защитный экран",
+            "экран"
+          ]
+        },
+        "sphere_upper": {
+          "nodes": [
+            "Bone_SphereUpper"
+          ],
+          "aliases": [
+            "верхняя полусфера",
+            "верхняя часть корпуса"
+          ]
+        },
+        "sphere_lower": {
+          "nodes": [
+            "Bone_SphereLower"
+          ],
+          "aliases": [
+            "нижняя полусфера",
+            "нижняя часть корпуса"
+          ]
+        },
+        "storage_cell": {
+          "nodes": [
+            "Bone_StorageCell"
+          ],
+          "aliases": [
+            "блок хранения",
+            "ячейка хранения"
+          ]
+        },
+        "transmitter": {
+          "nodes": [
+            "Bone_Transmitter"
+          ],
+          "aliases": [
+            "передатчик",
+            "радиопередатчик"
+          ]
+        }
+      }
+    }
   }
 ]

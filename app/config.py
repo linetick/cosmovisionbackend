@@ -34,6 +34,12 @@ VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8001/v1").strip().r
 VLLM_API_KEY = (os.getenv("VLLM_API_KEY") or "token-abc123").strip()
 VLLM_MODEL = os.getenv("VLLM_MODEL", MODEL_ID).strip() or MODEL_ID
 VLLM_TIMEOUT = float(os.getenv("VLLM_TIMEOUT", "120"))
+YANDEX_BASE_URL = os.getenv("YANDEX_BASE_URL", "https://ai.api.cloud.yandex.net/v1").strip().rstrip("/")
+YANDEX_API_KEY = (os.getenv("YANDEX_API_KEY") or "").strip()
+YANDEX_PROJECT_ID = (os.getenv("YANDEX_PROJECT_ID") or "").strip()
+YANDEX_MODEL = os.getenv("YANDEX_MODEL", "qwen3.6-35b-a3b/latest").strip() or "qwen3.6-35b-a3b/latest"
+YANDEX_TIMEOUT = float(os.getenv("YANDEX_TIMEOUT", "120"))
+YANDEX_PROMPT_ID = (os.getenv("YANDEX_PROMPT_ID") or "").strip() or None
 
 QUERY_STOPWORDS = {
     "а", "без", "был", "была", "были", "было", "быть", "в", "во", "вопрос", "все",

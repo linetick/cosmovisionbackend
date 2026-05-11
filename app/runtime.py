@@ -27,13 +27,14 @@ from .config import (
 print("SERVER DB_PATH =", DB_PATH)
 print("SERVER CWD =", os.getcwd())
 
-BACKEND_GPU_ENABLED = torch.cuda.is_available() and LLM_BACKEND != "vllm"
+REMOTE_LLM_BACKENDS = {"vllm", "yandex"}
+BACKEND_GPU_ENABLED = torch.cuda.is_available() and LLM_BACKEND not in REMOTE_LLM_BACKENDS
 device = "cuda" if BACKEND_GPU_ENABLED else "cpu"
 embedder_device = os.getenv("EMBEDDER_DEVICE", "cpu").strip().lower() or "cpu"
 if embedder_device == "cuda" and not BACKEND_GPU_ENABLED:
     embedder_device = "cpu"
 
-default_whisper_device = "cpu" if LLM_BACKEND == "vllm" else ("cuda" if torch.cuda.is_available() else "cpu")
+default_whisper_device = "cpu" if LLM_BACKEND in REMOTE_LLM_BACKENDS else ("cuda" if torch.cuda.is_available() else "cpu")
 WHISPER_DEVICE = (os.getenv("WHISPER_DEVICE") or default_whisper_device).strip().lower()
 if WHISPER_DEVICE == "cuda" and not torch.cuda.is_available():
     WHISPER_DEVICE = "cpu"
@@ -46,6 +47,8 @@ if device == "cuda":
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 elif LLM_BACKEND == "vllm" and torch.cuda.is_available():
     print("GPU зарезервирована под vLLM; backend работает на CPU.")
+elif LLM_BACKEND == "yandex" and torch.cuda.is_available():
+    print("LLM будет вызываться удаленно через Yandex Cloud; локальная GPU для генерации не используется.")
 print(f"Whisper будет загружен по требованию на: {WHISPER_DEVICE} ({WHISPER_COMPUTE_TYPE})")
 
 print("Загрузка модели эмбеддингов...")
@@ -56,6 +59,8 @@ model = None
 
 if LLM_BACKEND == "vllm":
     print(f"LLM backend: vLLM ({VLLM_BASE_URL}, model={VLLM_MODEL})")
+elif LLM_BACKEND == "yandex":
+    print("LLM backend: Yandex Cloud")
 else:
     print(f"Загрузка LLM ({MODEL_ID})...")
     if not HF_TOKEN and MODEL_ID.startswith("meta-llama/"):
