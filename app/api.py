@@ -5,7 +5,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from .config import APP_TITLE, APP_VERSION, DB_PATH, MODEL_FILES_DIR, MODEL_REGISTRY_PATH, REFUSAL
+from .config import AR_COMPACT_RESPONSES, APP_TITLE, APP_VERSION, DB_PATH, MODEL_FILES_DIR, MODEL_REGISTRY_PATH, REFUSAL
 from .model_store import ensure_model_storage, get_model_file_path, get_model_metadata, list_models
 from .query_logic import (
     COMMAND_ANSWERS,
@@ -39,6 +39,10 @@ class QueryRequest(BaseModel):
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 ensure_model_storage()
+
+
+def use_compact_generation() -> bool:
+    return AR_COMPACT_RESPONSES
 
 
 def command_response(query: str, command_type: str, answer: str, intent: str = "action") -> dict:
@@ -303,7 +307,9 @@ def handle_query(req: QueryRequest):
             }
 
         t5 = time.time()
-        if matched_command and matched_command["intent"] == "hybrid":
+        if use_compact_generation():
+            answer = generate_answer_compact(knowledge_query, context, hits)
+        elif matched_command and matched_command["intent"] == "hybrid":
             answer = generate_answer_compact(knowledge_query, context, hits)
         else:
             answer = generate_answer_strict(knowledge_query, context, hits)
@@ -563,7 +569,9 @@ async def handle_query_audio(
             }
 
         t6 = time.time()
-        if matched_command and matched_command["intent"] == "hybrid":
+        if use_compact_generation():
+            answer = generate_answer_compact(knowledge_query, context, hits)
+        elif matched_command and matched_command["intent"] == "hybrid":
             answer = generate_answer_compact(knowledge_query, context, hits)
         else:
             answer = generate_answer_strict(knowledge_query, context, hits)

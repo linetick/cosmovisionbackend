@@ -1,7 +1,18 @@
 import os
 
+from dotenv import load_dotenv
+
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WORKSPACE_DIR = os.path.dirname(BASE_DIR)
+
+for env_path in (
+    os.path.join(WORKSPACE_DIR, ".env"),
+    os.path.join(BASE_DIR, ".env"),
+):
+    if os.path.exists(env_path):
+        load_dotenv(env_path, override=False)
+
 DB_PATH = os.path.join(BASE_DIR, "knowledge_db")
 RAW_KB_DIR = os.path.join(BASE_DIR, "knowledge_raw")
 MODEL_STORAGE_DIR = os.path.join(BASE_DIR, "model_storage")
@@ -13,6 +24,7 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 APP_TITLE = "CosmoVision AI Backend"
 APP_VERSION = "2.1"
 REFUSAL = "В предоставленных данных нет информации."
+AR_COMPACT_RESPONSES = os.getenv("AR_COMPACT_RESPONSES", "1").strip().lower() not in {"0", "false", "no"}
 
 MODEL_ID = os.getenv("LLM_MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct").strip()
 LLM_BACKEND = os.getenv("LLM_BACKEND", "local").strip().lower()
@@ -40,6 +52,7 @@ YANDEX_PROJECT_ID = (os.getenv("YANDEX_PROJECT_ID") or "").strip()
 YANDEX_MODEL = os.getenv("YANDEX_MODEL", "qwen3.6-35b-a3b/latest").strip() or "qwen3.6-35b-a3b/latest"
 YANDEX_TIMEOUT = float(os.getenv("YANDEX_TIMEOUT", "120"))
 YANDEX_PROMPT_ID = (os.getenv("YANDEX_PROMPT_ID") or "").strip() or None
+YANDEX_LOG_USAGE = os.getenv("YANDEX_LOG_USAGE", "1").strip().lower() not in {"0", "false", "no"}
 
 QUERY_STOPWORDS = {
     "а", "без", "был", "была", "были", "было", "быть", "в", "во", "вопрос", "все",

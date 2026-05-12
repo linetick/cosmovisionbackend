@@ -28,6 +28,7 @@ from .config import (
     VLLM_TIMEOUT,
     YANDEX_API_KEY,
     YANDEX_BASE_URL,
+    YANDEX_LOG_USAGE,
     YANDEX_MODEL,
     YANDEX_PROJECT_ID,
     YANDEX_PROMPT_ID,
@@ -444,7 +445,7 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
     ]
 
-    raw = run_chat_generation(messages, max_new_tokens=SHORT_LLM_MAX_NEW_TOKENS)
+    raw = run_chat_generation(messages, max_new_tokens=SHORT_LLM_MAX_NEW_TOKENS, usage_label="router")
 
     parsed = _extract_json_object(raw)
     if not parsed:
@@ -850,7 +851,49 @@ def _extract_yandex_output_text(body: dict) -> str:
     return ""
 
 
-def generate_with_yandex(messages: list[dict], max_new_tokens: int, prompt_id: str | None = None) -> str:
+def _extract_yandex_usage(body: dict) -> dict:
+    usage = body.get("usage") or {}
+    input_details = usage.get("input_tokens_details") or {}
+    output_details = usage.get("output_tokens_details") or {}
+    prompt_info = body.get("prompt") or {}
+    return {
+        "status": body.get("status") or "",
+        "model": body.get("model") or "",
+        "prompt_id": prompt_info.get("id") or "",
+        "input_tokens": usage.get("input_tokens") or 0,
+        "cached_tokens": input_details.get("cached_tokens") or 0,
+        "tool_tokens": input_details.get("tool_tokens") or 0,
+        "output_tokens": usage.get("output_tokens") or 0,
+        "reasoning_tokens": output_details.get("reasoning_tokens") or 0,
+        "total_tokens": usage.get("total_tokens") or 0,
+    }
+
+
+def _log_yandex_usage(label: str, body: dict) -> None:
+    if not YANDEX_LOG_USAGE:
+        return
+    usage = _extract_yandex_usage(body)
+    model_name = usage["model"] or f"gpt://{YANDEX_PROJECT_ID}/{YANDEX_MODEL}"
+    prompt_part = f" prompt={usage['prompt_id']}" if usage["prompt_id"] else ""
+    print(
+        f"[Yandex usage][{label}]"
+        f" input={usage['input_tokens']}"
+        f" cached={usage['cached_tokens']}"
+        f" tool={usage['tool_tokens']}"
+        f" output={usage['output_tokens']}"
+        f" reasoning={usage['reasoning_tokens']}"
+        f" total={usage['total_tokens']}"
+        f" status={usage['status']}{prompt_part}"
+        f" model={model_name}"
+    )
+
+
+def generate_with_yandex(
+    messages: list[dict],
+    max_new_tokens: int,
+    prompt_id: str | None = None,
+    usage_label: str = "default",
+) -> str:
     if not YANDEX_API_KEY:
         raise RuntimeError("YANDEX_API_KEY не задан.")
     if not YANDEX_PROJECT_ID:
@@ -888,14 +931,20 @@ def generate_with_yandex(messages: list[dict], max_new_tokens: int, prompt_id: s
     except Exception as exc:
         raise RuntimeError(f"Yandex Cloud request failed: {exc}") from exc
 
+    _log_yandex_usage(usage_label, body)
     return _extract_yandex_output_text(body)
 
 
-def run_chat_generation(messages: list[dict], max_new_tokens: int, prompt_id: str | None = None) -> str:
+def run_chat_generation(
+    messages: list[dict],
+    max_new_tokens: int,
+    prompt_id: str | None = None,
+    usage_label: str = "default",
+) -> str:
     if LLM_BACKEND == "vllm":
         return generate_with_vllm(messages, max_new_tokens)
     if LLM_BACKEND == "yandex":
-        return generate_with_yandex(messages, max_new_tokens, prompt_id=prompt_id)
+        return generate_with_yandex(messages, max_new_tokens, prompt_id=prompt_id, usage_label=usage_label)
 
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(
@@ -938,7 +987,7 @@ def generate_answer_llm_only(query: str) -> str:
         {"role": "user", "content": user_content},
     ]
 
-    text = run_chat_generation(messages, max_new_tokens)
+    text = run_chat_generation(messages, max_new_tokens, usage_label="llm_only")
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"^ответ:\s*", "", text, flags=re.IGNORECASE)
     if not text or len(text) < 3:
@@ -987,7 +1036,7 @@ def generate_answer_strict(query: str, context: str, hits: list[dict] | None = N
     ]
 
     max_new_tokens = SHORT_LLM_MAX_NEW_TOKENS if brief_answer else LLM_MAX_NEW_TOKENS
-    text = run_chat_generation(messages, max_new_tokens)
+    text = run_chat_generation(messages, max_new_tokens, usage_label="rag_strict")
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"^ответ:\s*", "", text, flags=re.IGNORECASE)
     if not text or len(text) < 3:
@@ -1038,7 +1087,7 @@ def generate_answer_compact(query: str, context: str, hits: list[dict] | None = 
         {"role": "user", "content": user_content},
     ]
 
-    text = run_chat_generation(messages, SHORT_LLM_MAX_NEW_TOKENS)
+    text = run_chat_generation(messages, SHORT_LLM_MAX_NEW_TOKENS, usage_label="rag_compact")
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"^ответ:\s*", "", text, flags=re.IGNORECASE)
     if not text or len(text) < 3:

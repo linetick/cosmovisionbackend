@@ -8,5 +8,8 @@ fastapi
 uvicorn
 torch
 pyngrok
+nest_asyncio
+python-dotenv
 faster-whisper
 ffmpeg-python
+python-multipart
