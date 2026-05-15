@@ -35,6 +35,7 @@ LLM_MAX_INPUT_TOKENS = int(os.getenv("LLM_MAX_INPUT_TOKENS", "2048"))
 RAG_MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "1200"))
 SHORT_LLM_MAX_NEW_TOKENS = int(os.getenv("SHORT_LLM_MAX_NEW_TOKENS", "24"))
 SHORT_RAG_MAX_CONTEXT_CHARS = int(os.getenv("SHORT_RAG_MAX_CONTEXT_CHARS", "500"))
+RELEVANCE_GATE_ENABLED = os.getenv("RELEVANCE_GATE_ENABLED", "0").strip().lower() not in {"0", "false", "no"}
 LLM_FORCE_SINGLE_GPU = os.getenv("LLM_FORCE_SINGLE_GPU", "1").strip().lower() not in {"0", "false", "no"}
 LLM_ATTN_IMPLEMENTATION = os.getenv("LLM_ATTN_IMPLEMENTATION", "sdpa").strip()
 
@@ -52,6 +53,7 @@ YANDEX_PROJECT_ID = (os.getenv("YANDEX_PROJECT_ID") or "").strip()
 YANDEX_MODEL = os.getenv("YANDEX_MODEL", "qwen3.6-35b-a3b/latest").strip() or "qwen3.6-35b-a3b/latest"
 YANDEX_TIMEOUT = float(os.getenv("YANDEX_TIMEOUT", "120"))
 YANDEX_PROMPT_ID = (os.getenv("YANDEX_PROMPT_ID") or "").strip() or None
+YANDEX_ROUTER_PROMPT_ID = (os.getenv("YANDEX_ROUTER_PROMPT_ID") or "").strip() or None
 YANDEX_LOG_USAGE = os.getenv("YANDEX_LOG_USAGE", "1").strip().lower() not in {"0", "false", "no"}
 
 QUERY_STOPWORDS = {

@@ -18,6 +18,7 @@ from .config import (
     LLM_MAX_NEW_TOKENS,
     QUERY_STOPWORDS,
     RAG_MAX_CONTEXT_CHARS,
+    RELEVANCE_GATE_ENABLED,
     REFUSAL,
     REFUSAL_PATTERNS,
     SHORT_LLM_MAX_NEW_TOKENS,
@@ -32,6 +33,7 @@ from .config import (
     YANDEX_MODEL,
     YANDEX_PROJECT_ID,
     YANDEX_PROMPT_ID,
+    YANDEX_ROUTER_PROMPT_ID,
     YANDEX_TIMEOUT,
     WEAK_QUERY_TOKENS,
     WHISPER_BEAM_SIZE,
@@ -114,6 +116,28 @@ KNOWLEDGE_REQUEST_STEMS = (
     "расскаж", "объясн", "что такое", "что это", "что за",
     "для чего", "зачем", "как устро", "какой", "какая", "какие",
     "что делает", "что умеет", "информац", "опиш",
+)
+
+META_REQUEST_MARKERS = (
+    "привет", "здравствуйте", "кто вы", "кто ты", "чем вы занимаетесь",
+    "чем ты занимаешься", "что вы умеете", "что ты умеешь",
+    "как вас зовут", "как тебя зовут", "что вообще происходит",
+)
+
+GENERIC_CONCEPT_MARKERS = (
+    "в целом",
+    "вообще",
+    "в общем",
+)
+
+GENERIC_CONCEPT_TERMS = (
+    "спутник",
+    "космический аппарат",
+    "аппарат",
+    "орбита",
+    "антенна",
+    "солнечная панель",
+    "ракета",
 )
 
 
@@ -273,6 +297,72 @@ def looks_like_knowledge_request(query: str) -> bool:
     return any(marker in lowered for marker in KNOWLEDGE_REQUEST_STEMS)
 
 
+def looks_like_meta_request(query: str) -> bool:
+    lowered = (query or "").lower()
+    return any(marker in lowered for marker in META_REQUEST_MARKERS)
+
+
+def is_general_concept_query(query: str) -> bool:
+    q = re.sub(r"\s+", " ", (query or "").lower()).strip()
+    if not q or not is_definitional(q):
+        return False
+    if extract_designation_tokens(q):
+        return False
+    if any(marker in q for marker in GENERIC_CONCEPT_MARKERS):
+        return True
+    return any(term in q for term in GENERIC_CONCEPT_TERMS)
+
+
+def split_meta_and_knowledge_request(query: str) -> tuple[str | None, str | None]:
+    raw_segments = re.split(
+        r"(?<=[.!?])\s+|\s*,\s*|\s+\b(?:и|а|а еще|а ещё|также|так же)\b\s+",
+        (query or "").strip(),
+        flags=re.IGNORECASE,
+    )
+    meta_parts: list[str] = []
+    knowledge_parts: list[str] = []
+
+    for segment in raw_segments:
+        cleaned = segment.strip(" ,.")
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if looks_like_meta_request(lowered):
+            meta_parts.append(cleaned)
+            continue
+        if looks_like_knowledge_request(lowered) or is_off_topic(cleaned) is False:
+            knowledge_parts.append(cleaned)
+            continue
+        if "спутник" in lowered or "космос" in lowered or "метеор" in lowered:
+            knowledge_parts.append(cleaned)
+
+    meta_request = normalize_query(" ".join(meta_parts)) if meta_parts else None
+    knowledge_text = normalize_query(" ".join(knowledge_parts)) if knowledge_parts else None
+    return (meta_request or None, knowledge_text or None)
+
+
+def has_command_markers(query: str) -> bool:
+    return detect_client_command(query) is not None or looks_like_client_command(query)
+
+
+def extract_designation_tokens(text: str) -> set[str]:
+    normalized = (text or "").lower().replace("ё", "е")
+    matches = re.findall(r"[0-9a-zа-я]+(?:[-–—][0-9a-zа-я]+)+", normalized, flags=re.IGNORECASE)
+    designations: set[str] = set()
+    for match in matches:
+        candidate = re.sub(r"[-–—]+", "-", match.strip("-"))
+        parts = [part for part in candidate.split("-") if part]
+        if len(parts) < 2:
+            continue
+        if any(any(ch.isdigit() for ch in part) for part in parts) or any(len(part) <= 2 for part in parts[1:]):
+            designations.add(candidate)
+    return designations
+
+
+def is_multi_entity_query(query: str) -> bool:
+    return len(extract_designation_tokens(query)) >= 2
+
+
 def _extract_json_object(text: str) -> dict | None:
     if not text:
         return None
@@ -296,6 +386,54 @@ def _extract_json_object(text: str) -> dict | None:
 
 
 def classify_query_with_llm(query: str) -> dict | None:
+    if LLM_BACKEND == "yandex" and YANDEX_ROUTER_PROMPT_ID:
+        messages = [
+            {"role": "user", "content": query},
+        ]
+        raw = run_chat_generation(
+            messages,
+            max_new_tokens=SHORT_LLM_MAX_NEW_TOKENS,
+            prompt_id=YANDEX_ROUTER_PROMPT_ID,
+            usage_label="router",
+        )
+        parsed = _extract_json_object(raw)
+        if not parsed:
+            return None
+
+        intent = (parsed.get("intent") or "").strip()
+        meta_request = normalize_query((parsed.get("meta_request") or "").strip())
+        if intent == "info":
+            knowledge_text = (parsed.get("knowledge_text") or "").strip()
+            route = {
+                "intent": "info",
+            }
+            if knowledge_text:
+                route["knowledge_text"] = knowledge_text
+            elif not meta_request:
+                route["knowledge_text"] = query
+            if meta_request:
+                route["meta_request"] = meta_request
+            return route
+        if intent == "unknown_command":
+            return {"intent": "unknown_command"}
+        if intent not in {"action", "hybrid"}:
+            return None
+
+        command_type = (parsed.get("command_type") or "").strip()
+        if command_type not in COMMAND_ANSWERS:
+            return None
+
+        route = {
+            "intent": intent,
+            "command_type": command_type,
+        }
+        if intent == "hybrid":
+            knowledge_text = (parsed.get("knowledge_text") or "").strip()
+            route["knowledge_text"] = knowledge_text or ""
+        if meta_request:
+            route["meta_request"] = meta_request
+        return route
+
     allowed = ", ".join(COMMAND_TYPES)
     system = (
         "Ты маршрутизатор запросов для AR-приложения про космические аппараты.\n"
@@ -445,19 +583,31 @@ def classify_query_with_llm(query: str) -> dict | None:
         },
     ]
 
-    raw = run_chat_generation(messages, max_new_tokens=SHORT_LLM_MAX_NEW_TOKENS, usage_label="router")
+    raw = run_chat_generation(
+        messages,
+        max_new_tokens=SHORT_LLM_MAX_NEW_TOKENS,
+        prompt_id=YANDEX_ROUTER_PROMPT_ID,
+        usage_label="router",
+    )
 
     parsed = _extract_json_object(raw)
     if not parsed:
         return None
 
     intent = (parsed.get("intent") or "").strip()
+    meta_request = normalize_query((parsed.get("meta_request") or "").strip())
     if intent == "info":
         knowledge_text = (parsed.get("knowledge_text") or "").strip()
-        return {
+        route = {
             "intent": "info",
-            "knowledge_text": knowledge_text or query,
         }
+        if knowledge_text:
+            route["knowledge_text"] = knowledge_text
+        elif not meta_request:
+            route["knowledge_text"] = query
+        if meta_request:
+            route["meta_request"] = meta_request
+        return route
     if intent == "unknown_command":
         return {"intent": "unknown_command"}
     if intent not in {"action", "hybrid"}:
@@ -474,6 +624,8 @@ def classify_query_with_llm(query: str) -> dict | None:
     if intent == "hybrid":
         knowledge_text = (parsed.get("knowledge_text") or "").strip()
         route["knowledge_text"] = knowledge_text or ""
+    if meta_request:
+        route["meta_request"] = meta_request
     return route
 
 
@@ -538,6 +690,8 @@ def query_token_sets(query: str) -> tuple[set[str], set[str]]:
 def assess_context_relevance(query: str, context: str) -> dict:
     query_tokens, strong_tokens = query_token_sets(query)
     context_tokens = set(tokenize_for_match(context))
+    query_designations = extract_designation_tokens(query)
+    context_designations = extract_designation_tokens(context)
     total_overlap = len(query_tokens & context_tokens)
     strong_overlap = len(strong_tokens & context_tokens)
     return {
@@ -545,6 +699,9 @@ def assess_context_relevance(query: str, context: str) -> dict:
         "strong_tokens": len(strong_tokens),
         "total_overlap": total_overlap,
         "strong_overlap": strong_overlap,
+        "query_designations": query_designations,
+        "context_designations": context_designations,
+        "designation_overlap": len(query_designations & context_designations),
         "has_answer_marker": any(marker in context.lower() for marker in ANSWER_MARKERS),
     }
 
@@ -552,6 +709,10 @@ def assess_context_relevance(query: str, context: str) -> dict:
 def has_sufficient_context_relevance(query: str, context: str) -> tuple[bool, dict]:
     metrics = assess_context_relevance(query, context)
     if metrics["query_tokens"] == 0:
+        return False, metrics
+    if is_general_concept_query(query) and metrics["context_designations"]:
+        return False, metrics
+    if metrics["query_designations"] and metrics["designation_overlap"] == 0:
         return False, metrics
     if metrics["strong_overlap"] > 0:
         return True, metrics
@@ -596,6 +757,7 @@ def find_extractive_answer(query: str, hits: list[dict]) -> str | None:
     if not query_tokens:
         return None
 
+    generic_query = is_general_concept_query(query)
     best_text = None
     best_score = -1
     best_strong_overlap = 0
@@ -606,6 +768,8 @@ def find_extractive_answer(query: str, hits: list[dict]) -> str | None:
         meta = hit.get("meta") or {}
         section = meta.get("section") or ""
         section_tokens = set(tokenize_for_match(section))
+        if generic_query and extract_designation_tokens(doc):
+            continue
 
         for candidate in split_doc_candidates(doc):
             candidate_tokens = set(tokenize_for_match(candidate))
@@ -735,6 +899,8 @@ def retrieve_context(query: str, initial_n: int = 3, max_n: int = 8) -> tuple[st
 def extract_definition_from_context(query: str, context: str) -> str | None:
     q = query.lower()
     c = context
+    if is_general_concept_query(query) and extract_designation_tokens(context):
+        return None
     if "метеор" in q:
         match = re.search(r"(Метеор[-–— ]?М\s*—\s*это[^\n\.]*[\.]?)", c, flags=re.IGNORECASE)
         if match:
@@ -972,20 +1138,24 @@ def generate_answer_llm_only(query: str) -> str:
     brief_answer = wants_brief_answer(query)
     max_new_tokens = SHORT_LLM_MAX_NEW_TOKENS if brief_answer else LLM_MAX_NEW_TOKENS
 
-    system = (
-        "Ты ИИ-ассистент по космонавтике.\n"
-        "Отвечай по существу и без лишней воды.\n"
-        "Если пользователь просит кратко, отвечай кратко."
-    )
-
     user_content = query
     if brief_answer:
         user_content += "\n\nОтветь одним коротким предложением."
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_content},
-    ]
+    if LLM_BACKEND == "yandex" and YANDEX_PROMPT_ID:
+        messages = [
+            {"role": "user", "content": user_content},
+        ]
+    else:
+        system = (
+            "Ты ИИ-ассистент по космонавтике.\n"
+            "Отвечай по существу и без лишней воды.\n"
+            "Если пользователь просит кратко, отвечай кратко."
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ]
 
     text = run_chat_generation(messages, max_new_tokens, usage_label="llm_only")
     text = re.sub(r"\s+", " ", text).strip()
@@ -995,17 +1165,68 @@ def generate_answer_llm_only(query: str) -> str:
     return squeeze_to_one_sentence(text) if brief_answer else text
 
 
-def generate_answer_strict(query: str, context: str, hits: list[dict] | None = None) -> str:
-    brief_answer = wants_brief_answer(query)
+def generate_answer_fallback(query: str, meta_request: str | None = None) -> str:
+    meta_request = (meta_request or "").strip() or None
+    max_new_tokens = max(SHORT_LLM_MAX_NEW_TOKENS, 48)
 
-    if is_definitional(query) or brief_answer:
+    user_parts = [
+        "РЕЖИМ FALLBACK.\nВ базе знаний по этому вопросу нет информации.",
+    ]
+    if meta_request:
+        user_parts.append(f"ВОПРОС О СИСТЕМЕ:\n{meta_request}")
+    user_parts.append(f"ВОПРОС О КОСМИЧЕСКОМ АППАРАТЕ:\n{query}")
+    user_parts.append(
+        "Кратко ответь по общим знаниям. "
+        "Если у тебя есть доступ к интернет-поиску или внешним инструментам, можешь использовать их. "
+        "Обязательно явно скажи, что в базе знаний нет информации, а в конце добавь: "
+        "«Ответ может быть неточным.» "
+        "Ответ должен быть коротким и понятным."
+    )
+    user_content = "\n\n".join(user_parts)
+
+    if LLM_BACKEND == "yandex" and YANDEX_PROMPT_ID:
+        messages = [
+            {"role": "user", "content": user_content},
+        ]
+    else:
+        system = (
+            "Ты ИИ-ассистент по космонавтике.\n"
+            "Если база знаний не дала ответа, разрешено кратко отвечать по общим знаниям.\n"
+            "Если у тебя есть доступ к внешним инструментам, можно их использовать.\n"
+            "Нужно явно сказать, что в базе знаний нет информации, и предупредить, что ответ может быть неточным."
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ]
+
+    text = run_chat_generation(messages, max_new_tokens, usage_label="rag_fallback")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^ответ:\s*", "", text, flags=re.IGNORECASE)
+    if not text or len(text) < 3:
+        return REFUSAL
+    return text
+
+
+def generate_answer_strict(
+    query: str,
+    context: str,
+    hits: list[dict] | None = None,
+    meta_request: str | None = None,
+) -> str:
+    brief_answer = wants_brief_answer(query)
+    meta_request = (meta_request or "").strip() or None
+    multi_entity = is_multi_entity_query(query)
+
+    if not meta_request and not multi_entity and (is_definitional(query) or brief_answer):
         defin = extract_definition_from_context(query, context)
         if defin:
             return squeeze_to_one_sentence(defin) if brief_answer else defin
 
-    extractive = find_extractive_answer(query, hits or [])
-    if extractive:
-        return squeeze_to_one_sentence(extractive) if brief_answer else extractive
+    if not meta_request and not multi_entity:
+        extractive = find_extractive_answer(query, hits or [])
+        if extractive:
+            return squeeze_to_one_sentence(extractive) if brief_answer else extractive
 
     if not context.strip():
         return REFUSAL
@@ -1015,25 +1236,46 @@ def generate_answer_strict(query: str, context: str, hits: list[dict] | None = N
         if shorter_context:
             context = shorter_context
 
-    relevant, _ = has_sufficient_context_relevance(query, context)
-    if not relevant:
-        return REFUSAL
+    if RELEVANCE_GATE_ENABLED:
+        relevant, _ = has_sufficient_context_relevance(query, context)
+        if not relevant:
+            return REFUSAL
 
-    system = (
-        "Ты — ИИ-ассистент по космонавтике с RAG.\n"
-        "Отвечай только по фрагментам базы знаний из блока КОНТЕКСТ.\n"
-        "Нельзя добавлять факты не из контекста.\n"
-        f"Если в контексте нет ответа, верни ровно: {REFUSAL}"
-    )
-
-    user_content = f"КОНТЕКСТ:\n{context}\n\nВОПРОС: {query}"
+    user_parts: list[str] = []
+    if meta_request:
+        user_parts.append(f"ВОПРОС О СИСТЕМЕ:\n{meta_request}")
+    user_parts.append(f"КОНТЕКСТ:\n{context}")
+    user_parts.append(f"ВОПРОС О КОСМИЧЕСКОМ АППАРАТЕ:\n{query}")
+    user_content = "\n\n".join(user_parts)
+    if meta_request:
+        user_content += (
+            "\n\nЕсли есть вопрос о системе, ответь на него из своей инструкции. "
+            "Факты о космическом аппарате бери только из блока КОНТЕКСТ."
+        )
+    if multi_entity:
+        user_content += "\n\nВ вопросе упомянуто несколько космических аппаратов. Если контекст позволяет, кратко ответь по каждому из них."
     if brief_answer:
-        user_content += "\n\nОтветь одним коротким предложением без вводных слов."
+        if meta_request:
+            user_content += "\n\nОтветь очень кратко одним предложением, сначала про систему, затем про аппарат."
+        else:
+            user_content += "\n\nОтветь одним коротким предложением без вводных слов."
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_content},
-    ]
+    if LLM_BACKEND == "yandex" and YANDEX_PROMPT_ID:
+        messages = [
+            {"role": "user", "content": user_content},
+        ]
+    else:
+        system = (
+            "Ты — ИИ-ассистент по космонавтике с RAG.\n"
+            "Отвечай только по фрагментам базы знаний из блока КОНТЕКСТ.\n"
+            "Нельзя добавлять факты не из контекста.\n"
+            "Если в запросе есть вопрос о системе, отвечай на него из своей инструкции, а не из контекста.\n"
+            f"Если в контексте нет ответа, верни ровно: {REFUSAL}"
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ]
 
     max_new_tokens = SHORT_LLM_MAX_NEW_TOKENS if brief_answer else LLM_MAX_NEW_TOKENS
     text = run_chat_generation(messages, max_new_tokens, usage_label="rag_strict")
@@ -1046,15 +1288,24 @@ def generate_answer_strict(query: str, context: str, hits: list[dict] | None = N
     return squeeze_to_one_sentence(text) if brief_answer else text
 
 
-def generate_answer_compact(query: str, context: str, hits: list[dict] | None = None) -> str:
-    if is_definitional(query):
+def generate_answer_compact(
+    query: str,
+    context: str,
+    hits: list[dict] | None = None,
+    meta_request: str | None = None,
+) -> str:
+    meta_request = (meta_request or "").strip() or None
+    multi_entity = is_multi_entity_query(query)
+
+    if not meta_request and not multi_entity and is_definitional(query):
         defin = extract_definition_from_context(query, context)
         if defin:
             return squeeze_to_one_sentence(defin)
 
-    extractive = find_extractive_answer(query, hits or [])
-    if extractive:
-        return squeeze_to_one_sentence(extractive)
+    if not meta_request and not multi_entity:
+        extractive = find_extractive_answer(query, hits or [])
+        if extractive:
+            return squeeze_to_one_sentence(extractive)
 
     if not context.strip():
         return REFUSAL
@@ -1064,28 +1315,43 @@ def generate_answer_compact(query: str, context: str, hits: list[dict] | None = 
         if shorter_context:
             context = shorter_context
 
-    relevant, _ = has_sufficient_context_relevance(query, context)
-    if not relevant:
-        return REFUSAL
+    if RELEVANCE_GATE_ENABLED:
+        relevant, _ = has_sufficient_context_relevance(query, context)
+        if not relevant:
+            return REFUSAL
 
-    system = (
-        "Ты — ИИ-ассистент по космонавтике с RAG.\n"
-        "Отвечай только по фрагментам базы знаний из блока КОНТЕКСТ.\n"
-        "Нельзя добавлять факты не из контекста.\n"
-        "Ответ должен быть кратким: одно короткое содержательное предложение без вводных слов.\n"
-        f"Если в контексте нет ответа, верни ровно: {REFUSAL}"
-    )
+    user_parts: list[str] = []
+    if meta_request:
+        user_parts.append(f"ВОПРОС О СИСТЕМЕ:\n{meta_request}")
+    user_parts.append(f"КОНТЕКСТ:\n{context}")
+    user_parts.append(f"ВОПРОС О КОСМИЧЕСКОМ АППАРАТЕ:\n{query}")
+    user_content = "\n\n".join(user_parts)
+    if meta_request:
+        user_content += (
+            "\n\nЕсли есть вопрос о системе, ответь на него из своей инструкции. "
+            "Факты о космическом аппарате бери только из блока КОНТЕКСТ."
+        )
+    if multi_entity:
+        user_content += "\n\nВ вопросе упомянуто несколько космических аппаратов. Если контекст позволяет, кратко ответь по каждому из них."
+    user_content += "\n\nОтветь одним коротким предложением."
 
-    user_content = (
-        f"КОНТЕКСТ:\n{context}\n\n"
-        f"ВОПРОС: {query}\n\n"
-        "Ответь одним коротким предложением."
-    )
-
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_content},
-    ]
+    if LLM_BACKEND == "yandex" and YANDEX_PROMPT_ID:
+        messages = [
+            {"role": "user", "content": user_content},
+        ]
+    else:
+        system = (
+            "Ты — ИИ-ассистент по космонавтике с RAG.\n"
+            "Отвечай только по фрагментам базы знаний из блока КОНТЕКСТ.\n"
+            "Нельзя добавлять факты не из контекста.\n"
+            "Если в запросе есть вопрос о системе, отвечай на него из своей инструкции, а не из контекста.\n"
+            "Ответ должен быть кратким: одно короткое содержательное предложение без вводных слов.\n"
+            f"Если в контексте нет ответа, верни ровно: {REFUSAL}"
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ]
 
     text = run_chat_generation(messages, SHORT_LLM_MAX_NEW_TOKENS, usage_label="rag_compact")
     text = re.sub(r"\s+", " ", text).strip()
