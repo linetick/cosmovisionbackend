@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from .config import AR_COMPACT_RESPONSES, APP_TITLE, APP_VERSION, DB_PATH, MODEL_FILES_DIR, MODEL_REGISTRY_PATH, REFUSAL
 from .model_store import ensure_model_storage, get_model_file_path, get_model_metadata, list_models
-from .query_logic import (
+from .query import (
     COMMAND_ANSWERS,
     build_context_from_hits,
     classify_query_with_llm,
@@ -32,6 +32,7 @@ from .query_logic import (
     transcribe_audio_bytes_detailed,
 )
 from .runtime import collection, warmup
+from .auth import router as auth_router
 
 
 class QueryRequest(BaseModel):
@@ -41,6 +42,7 @@ class QueryRequest(BaseModel):
 
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
+app.include_router(auth_router)
 ensure_model_storage()
 
 
@@ -198,9 +200,7 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
                 "meta_request": (llm_route.get("meta_request") or "").strip() or None,
             }, debug
         debug["resolution"] = "llm_info"
-        route = {
-            "intent": "info",
-        }
+        route = {"intent": "info"}
         knowledge_text = (llm_route.get("knowledge_text") or "").strip()
         meta_request = (llm_route.get("meta_request") or "").strip()
         if knowledge_text:
@@ -228,10 +228,164 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
         return {"intent": "unknown_command"}, debug
 
     debug["resolution"] = "fallback_info"
-    return {
-        "intent": "info",
-        "knowledge_text": query,
-    }, debug
+    return {"intent": "info", "knowledge_text": query}, debug
+
+
+def _finalize(
+    resp: dict,
+    base_timing: dict,
+    extra_timing: dict,
+    t_start: float,
+    transcript: str | None,
+) -> dict:
+    if transcript is not None:
+        resp["transcript"] = transcript
+    resp["timing"] = {**base_timing, **extra_timing, "total": round(time.time() - t_start, 3)}
+    return resp
+
+
+def _handle_query_core(
+    q_raw: str,
+    q: str,
+    spacecraft: str | None,
+    t_start: float,
+    base_timing: dict,
+    transcript: str | None = None,
+) -> dict:
+    if spacecraft:
+        q = inject_spacecraft_context(q, spacecraft)
+
+    if not q:
+        return _finalize(
+            {"query": q_raw, "intent": "info", "client_command": None, "answer": REFUSAL, "context_used": False},
+            base_timing, {}, t_start, transcript,
+        )
+
+    matched_command, _ = resolve_client_command(q)
+
+    if matched_command and matched_command["intent"] == "action":
+        return _finalize(
+            command_response(q, matched_command["type"], matched_command["answer"]),
+            base_timing, {}, t_start, transcript,
+        )
+
+    if matched_command and matched_command["intent"] == "unknown_command":
+        return _finalize(unknown_command_response(q), base_timing, {}, t_start, transcript)
+
+    meta_request = None
+    if matched_command and matched_command["intent"] in {"info", "hybrid"}:
+        meta_request = normalize_query((matched_command.get("meta_request") or "").strip()) or None
+
+    knowledge_query = q
+    if matched_command and matched_command["intent"] == "hybrid":
+        knowledge_query = (matched_command.get("knowledge_text") or "").strip()
+        if not knowledge_query:
+            knowledge_query = extract_knowledge_query_from_compound(
+                q, matched_command["type"], current_spacecraft=spacecraft,
+            )
+        else:
+            knowledge_query = normalize_query(knowledge_query)
+            if spacecraft:
+                knowledge_query = inject_spacecraft_context(knowledge_query, spacecraft)
+    elif matched_command and matched_command["intent"] == "info":
+        routed_knowledge_text = (matched_command.get("knowledge_text") or "").strip()
+        if routed_knowledge_text:
+            knowledge_query = normalize_query(routed_knowledge_text)
+        elif meta_request:
+            knowledge_query = ""
+        else:
+            knowledge_query = q
+        if knowledge_query and spacecraft:
+            knowledge_query = inject_spacecraft_context(knowledge_query, spacecraft)
+
+    if meta_request and not knowledge_query:
+        t0 = time.time()
+        meta_answer = generate_meta_answer(meta_request)
+        resp = {
+            "query": q, "intent": "info", "client_command": None,
+            "meta_request": meta_request, "answer": meta_answer, "context_used": False,
+        }
+        return _finalize(resp, base_timing, {"meta_generate": round(time.time() - t0, 3)}, t_start, transcript)
+
+    t_topic0 = time.time()
+    off_topic = is_off_topic(knowledge_query)
+    topic_timing = {"topic_check": round(time.time() - t_topic0, 3)}
+
+    if off_topic and not (matched_command and matched_command["intent"] == "hybrid"):
+        resp = {
+            "query": q, "intent": "off_topic", "client_command": None,
+            "answer": (
+                "Я отвечаю только по космонавтике из базы знаний. "
+                "Спроси, например: «Как устроены солнечные панели на Метеоре-М?»"
+            ),
+            "context_used": False,
+        }
+        return _finalize(resp, base_timing, topic_timing, t_start, transcript)
+
+    t_retr0 = time.time()
+    context, hits, rs = retrieve_context(knowledge_query, initial_n=3, max_n=9)
+    retr_timing = {
+        "retrieve": round(time.time() - t_retr0, 3),
+        "retrieve_embed": round(rs["embed"], 3),
+        "retrieve_search": round(rs["search"], 3),
+        "retrieve_postprocess": round(rs["postprocess"], 3),
+        "retrieve_context_build": round(rs["context_build"], 3),
+    }
+
+    is_hybrid = bool(matched_command and matched_command["intent"] == "hybrid")
+
+    def _result(answer: str, context_used: bool, extra: dict | None = None) -> dict:
+        if is_hybrid:
+            r = {
+                "query": q, "intent": "hybrid",
+                "client_command": {"type": matched_command["type"]},
+                "knowledge_query": knowledge_query,
+                "answer": build_compound_answer(matched_command["answer"], answer),
+                "context_used": context_used,
+            }
+        else:
+            r = {"query": q, "intent": "info", "client_command": None, "answer": answer, "context_used": context_used}
+        if meta_request:
+            r["meta_request"] = meta_request
+        if extra:
+            r.update(extra)
+        return r
+
+    if not context:
+        t_fb0 = time.time()
+        fallback_answer = generate_answer_fallback(knowledge_query, meta_request=meta_request)
+        fb_timing = {"fallback_generate": round(time.time() - t_fb0, 3)}
+        if fallback_answer != REFUSAL:
+            return _finalize(
+                _result(fallback_answer, False, {"fallback_used": True}),
+                base_timing, {**topic_timing, **retr_timing, **fb_timing}, t_start, transcript,
+            )
+        return _finalize(
+            _result(REFUSAL, False),
+            base_timing, {**topic_timing, **retr_timing}, t_start, transcript,
+        )
+
+    t_gen0 = time.time()
+    if use_compact_generation() or is_hybrid:
+        answer = generate_answer_compact(knowledge_query, context, hits, meta_request=meta_request)
+    else:
+        answer = generate_answer_strict(knowledge_query, context, hits, meta_request=meta_request)
+    gen_timing = {"generate": round(time.time() - t_gen0, 3)}
+
+    if answer == REFUSAL:
+        t_fb0 = time.time()
+        fallback_answer = generate_answer_fallback(knowledge_query, meta_request=meta_request)
+        fb_timing = {"fallback_generate": round(time.time() - t_fb0, 3)}
+        if fallback_answer != REFUSAL:
+            return _finalize(
+                _result(fallback_answer, False, {"fallback_used": True}),
+                base_timing, {**topic_timing, **retr_timing, **gen_timing, **fb_timing}, t_start, transcript,
+            )
+
+    return _finalize(
+        _result(answer, answer != REFUSAL),
+        base_timing, {**topic_timing, **retr_timing, **gen_timing}, t_start, transcript,
+    )
 
 
 @app.post("/query")
@@ -241,312 +395,11 @@ def handle_query(req: QueryRequest):
         raw = req.text or ""
         q = normalize_query(raw)
         t1 = time.time()
-        current_spacecraft = resolve_current_spacecraft(
+        spacecraft = resolve_current_spacecraft(
             current_model_id=req.current_model_id,
             current_spacecraft=req.current_spacecraft,
         )
-        if current_spacecraft:
-            q = inject_spacecraft_context(q, current_spacecraft)
-
-        if not q:
-            return {
-                "query": raw,
-                "intent": "info",
-                "client_command": None,
-                "answer": REFUSAL,
-                "context_used": False,
-                "timing": {
-                    "normalize": round(t1 - t0, 3),
-                    "total": round(t1 - t0, 3),
-                },
-            }
-
-        matched_command, command_debug = resolve_client_command(q)
-        if matched_command and matched_command["intent"] == "action":
-            result = command_response(q, matched_command["type"], matched_command["answer"])
-            result["timing"] = {
-                "normalize": round(t1 - t0, 3),
-                "total": round(t1 - t0, 3),
-            }
-            return result
-
-        if matched_command and matched_command["intent"] == "unknown_command":
-            result = unknown_command_response(q)
-            result["timing"] = {
-                "normalize": round(t1 - t0, 3),
-                "total": round(t1 - t0, 3),
-            }
-            return result
-
-        meta_request = None
-        if matched_command and matched_command["intent"] in {"info", "hybrid"}:
-            meta_request = normalize_query((matched_command.get("meta_request") or "").strip()) or None
-
-        knowledge_query = q
-        if matched_command and matched_command["intent"] == "hybrid":
-            knowledge_query = (matched_command.get("knowledge_text") or "").strip()
-            if not knowledge_query:
-                knowledge_query = extract_knowledge_query_from_compound(
-                    q,
-                    matched_command["type"],
-                    current_spacecraft=current_spacecraft,
-                )
-            else:
-                knowledge_query = normalize_query(knowledge_query)
-                if current_spacecraft:
-                    knowledge_query = inject_spacecraft_context(knowledge_query, current_spacecraft)
-        elif matched_command and matched_command["intent"] == "info":
-            routed_knowledge_text = (matched_command.get("knowledge_text") or "").strip()
-            if routed_knowledge_text:
-                knowledge_query = normalize_query(routed_knowledge_text)
-            elif meta_request:
-                knowledge_query = ""
-            else:
-                knowledge_query = q
-            if knowledge_query and current_spacecraft:
-                knowledge_query = inject_spacecraft_context(knowledge_query, current_spacecraft)
-
-        if meta_request and not knowledge_query:
-            t2 = time.time()
-            meta_answer = generate_meta_answer(meta_request)
-            t3 = time.time()
-            return {
-                "query": q,
-                "intent": "info",
-                "client_command": None,
-                "meta_request": meta_request,
-                "answer": meta_answer,
-                "context_used": False,
-                "timing": {
-                    "normalize": round(t1 - t0, 3),
-                    "meta_generate": round(t3 - t2, 3),
-                    "total": round(t3 - t0, 3),
-                },
-            }
-
-        topic_check_start = t1
-        off_topic = is_off_topic(knowledge_query)
-        t2 = time.time()
-        if off_topic and not (matched_command and matched_command["intent"] == "hybrid"):
-            answer = (
-                "Я отвечаю только по космонавтике из базы знаний. "
-                "Спроси, например: «Как устроены солнечные панели на Метеоре-М?»"
-            )
-            result = {
-                "query": q,
-                "intent": "off_topic",
-                "client_command": None,
-                "answer": answer,
-                "context_used": False,
-                "timing": {
-                    "normalize": round(t1 - t0, 3),
-                    "topic_check": round(t2 - topic_check_start, 3),
-                    "total": round(t2 - t0, 3),
-                },
-            }
-            return result
-
-        t3 = time.time()
-        context, hits, retrieve_stats = retrieve_context(knowledge_query, initial_n=3, max_n=9)
-        t4 = time.time()
-        if not context:
-            t_fallback0 = time.time()
-            fallback_answer = generate_answer_fallback(knowledge_query, meta_request=meta_request)
-            t_fallback1 = time.time()
-            if fallback_answer != REFUSAL:
-                if matched_command and matched_command["intent"] == "hybrid":
-                    result = {
-                        "query": q,
-                        "intent": "hybrid",
-                        "client_command": {
-                            "type": matched_command["type"],
-                        },
-                        "knowledge_query": knowledge_query,
-                        "answer": build_compound_answer(matched_command["answer"], fallback_answer),
-                        "context_used": False,
-                        "fallback_used": True,
-                        "timing": {
-                            "normalize": round(t1 - t0, 3),
-                            "topic_check": round(t2 - topic_check_start, 3),
-                            "retrieve": round(t4 - t3, 3),
-                            "retrieve_embed": round(retrieve_stats["embed"], 3),
-                            "retrieve_search": round(retrieve_stats["search"], 3),
-                            "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                            "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                            "fallback_generate": round(t_fallback1 - t_fallback0, 3),
-                            "total": round(t_fallback1 - t0, 3),
-                        },
-                    }
-                    if meta_request:
-                        result["meta_request"] = meta_request
-                    return result
-                result = {
-                    "query": q,
-                    "intent": "info",
-                    "client_command": None,
-                    "answer": fallback_answer,
-                    "context_used": False,
-                    "fallback_used": True,
-                    "timing": {
-                        "normalize": round(t1 - t0, 3),
-                        "topic_check": round(t2 - topic_check_start, 3),
-                        "retrieve": round(t4 - t3, 3),
-                        "retrieve_embed": round(retrieve_stats["embed"], 3),
-                        "retrieve_search": round(retrieve_stats["search"], 3),
-                        "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                        "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                        "fallback_generate": round(t_fallback1 - t_fallback0, 3),
-                        "total": round(t_fallback1 - t0, 3),
-                    },
-                }
-                if meta_request:
-                    result["meta_request"] = meta_request
-                return result
-            if matched_command and matched_command["intent"] == "hybrid":
-                return {
-                    "query": q,
-                    "intent": "hybrid",
-                    "client_command": {
-                        "type": matched_command["type"],
-                    },
-                    "knowledge_query": knowledge_query,
-                    "answer": build_compound_answer(matched_command["answer"], REFUSAL),
-                    "context_used": False,
-                    "timing": {
-                        "normalize": round(t1 - t0, 3),
-                        "topic_check": round(t2 - topic_check_start, 3),
-                        "retrieve": round(t4 - t3, 3),
-                        "retrieve_embed": round(retrieve_stats["embed"], 3),
-                        "retrieve_search": round(retrieve_stats["search"], 3),
-                        "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                        "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                        "total": round(t4 - t0, 3),
-                    },
-                }
-            return {
-                "query": q,
-                "intent": "info",
-                "client_command": None,
-                "answer": REFUSAL,
-                "context_used": False,
-                "timing": {
-                    "normalize": round(t1 - t0, 3),
-                    "topic_check": round(t2 - topic_check_start, 3),
-                    "retrieve": round(t4 - t3, 3),
-                    "retrieve_embed": round(retrieve_stats["embed"], 3),
-                    "retrieve_search": round(retrieve_stats["search"], 3),
-                    "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                    "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                    "total": round(t4 - t0, 3),
-                },
-            }
-
-        t5 = time.time()
-        if use_compact_generation():
-            answer = generate_answer_compact(knowledge_query, context, hits, meta_request=meta_request)
-        elif matched_command and matched_command["intent"] == "hybrid":
-            answer = generate_answer_compact(knowledge_query, context, hits, meta_request=meta_request)
-        else:
-            answer = generate_answer_strict(knowledge_query, context, hits, meta_request=meta_request)
-        t6 = time.time()
-        if answer == REFUSAL:
-            t_fallback0 = time.time()
-            fallback_answer = generate_answer_fallback(knowledge_query, meta_request=meta_request)
-            t_fallback1 = time.time()
-            if fallback_answer != REFUSAL:
-                if matched_command and matched_command["intent"] == "hybrid":
-                    result = {
-                        "query": q,
-                        "intent": "hybrid",
-                        "client_command": {
-                            "type": matched_command["type"],
-                        },
-                        "knowledge_query": knowledge_query,
-                        "answer": build_compound_answer(matched_command["answer"], fallback_answer),
-                        "context_used": False,
-                        "fallback_used": True,
-                        "timing": {
-                            "normalize": round(t1 - t0, 3),
-                            "topic_check": round(t2 - topic_check_start, 3),
-                            "retrieve": round(t4 - t3, 3),
-                            "retrieve_embed": round(retrieve_stats["embed"], 3),
-                            "retrieve_search": round(retrieve_stats["search"], 3),
-                            "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                            "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                            "generate": round(t6 - t5, 3),
-                            "fallback_generate": round(t_fallback1 - t_fallback0, 3),
-                            "total": round(t_fallback1 - t0, 3),
-                        },
-                    }
-                    if meta_request:
-                        result["meta_request"] = meta_request
-                    return result
-                result = {
-                    "query": q,
-                    "intent": "info",
-                    "client_command": None,
-                    "answer": fallback_answer,
-                    "context_used": False,
-                    "fallback_used": True,
-                    "timing": {
-                        "normalize": round(t1 - t0, 3),
-                        "topic_check": round(t2 - topic_check_start, 3),
-                        "retrieve": round(t4 - t3, 3),
-                        "retrieve_embed": round(retrieve_stats["embed"], 3),
-                        "retrieve_search": round(retrieve_stats["search"], 3),
-                        "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                        "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                        "generate": round(t6 - t5, 3),
-                        "fallback_generate": round(t_fallback1 - t_fallback0, 3),
-                        "total": round(t_fallback1 - t0, 3),
-                    },
-                }
-                if meta_request:
-                    result["meta_request"] = meta_request
-                return result
-        if matched_command and matched_command["intent"] == "hybrid":
-            return {
-                "query": q,
-                "intent": "hybrid",
-                "client_command": {
-                    "type": matched_command["type"],
-                },
-                "knowledge_query": knowledge_query,
-                "answer": build_compound_answer(matched_command["answer"], answer),
-                "context_used": (answer != REFUSAL),
-                "timing": {
-                    "normalize": round(t1 - t0, 3),
-                    "topic_check": round(t2 - topic_check_start, 3),
-                    "retrieve": round(t4 - t3, 3),
-                    "retrieve_embed": round(retrieve_stats["embed"], 3),
-                    "retrieve_search": round(retrieve_stats["search"], 3),
-                    "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                    "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                    "generate": round(t6 - t5, 3),
-                    "total": round(t6 - t0, 3),
-                },
-            }
-        result = {
-            "query": q,
-            "intent": "info",
-            "client_command": None,
-            "answer": answer,
-            "context_used": (answer != REFUSAL),
-            "timing": {
-                "normalize": round(t1 - t0, 3),
-                "topic_check": round(t2 - topic_check_start, 3),
-                "retrieve": round(t4 - t3, 3),
-                "retrieve_embed": round(retrieve_stats["embed"], 3),
-                "retrieve_search": round(retrieve_stats["search"], 3),
-                "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                "generate": round(t6 - t5, 3),
-                "total": round(t6 - t0, 3),
-            },
-        }
-        if meta_request:
-            result["meta_request"] = meta_request
-        return result
+        return _handle_query_core(raw, q, spacecraft, t0, {"normalize": round(t1 - t0, 3)})
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(exc)}")
 
@@ -621,363 +474,17 @@ async def handle_query_audio(
         t1 = time.time()
         q = normalize_query(transcript)
         t2 = time.time()
-        resolved_spacecraft = resolve_current_spacecraft(
+        spacecraft = resolve_current_spacecraft(
             current_model_id=current_model_id,
             current_spacecraft=current_spacecraft,
         )
-        if resolved_spacecraft:
-            q = inject_spacecraft_context(q, resolved_spacecraft)
-
-        if not q:
-            return {
-                "answer": REFUSAL,
-                "intent": "info",
-                "client_command": None,
-                "context_used": False,
-                "transcript": transcript,
-                "timing": {
-                    "asr": round(t1 - t0, 3),
-                    "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                    "transcribe": round(asr_stats["transcribe"], 3),
-                    "normalize": round(t2 - t1, 3),
-                    "total": round(t2 - t0, 3),
-                },
-            }
-
-        matched_command, command_debug = resolve_client_command(q)
-        if matched_command and matched_command["intent"] == "action":
-            result = command_response(q, matched_command["type"], matched_command["answer"])
-            result["transcript"] = transcript
-            result["timing"] = {
-                "asr": round(t1 - t0, 3),
-                "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                "transcribe": round(asr_stats["transcribe"], 3),
-                "normalize": round(t2 - t1, 3),
-                "total": round(t2 - t0, 3),
-            }
-            return result
-
-        if matched_command and matched_command["intent"] == "unknown_command":
-            result = unknown_command_response(q)
-            result["transcript"] = transcript
-            result["timing"] = {
-                "asr": round(t1 - t0, 3),
-                "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                "transcribe": round(asr_stats["transcribe"], 3),
-                "normalize": round(t2 - t1, 3),
-                "total": round(t2 - t0, 3),
-            }
-            return result
-
-        meta_request = None
-        if matched_command and matched_command["intent"] in {"info", "hybrid"}:
-            meta_request = normalize_query((matched_command.get("meta_request") or "").strip()) or None
-
-        knowledge_query = q
-        if matched_command and matched_command["intent"] == "hybrid":
-            knowledge_query = (matched_command.get("knowledge_text") or "").strip()
-            if not knowledge_query:
-                knowledge_query = extract_knowledge_query_from_compound(
-                    q,
-                    matched_command["type"],
-                    current_spacecraft=resolved_spacecraft,
-                )
-            else:
-                knowledge_query = normalize_query(knowledge_query)
-                if resolved_spacecraft:
-                    knowledge_query = inject_spacecraft_context(knowledge_query, resolved_spacecraft)
-        elif matched_command and matched_command["intent"] == "info":
-            routed_knowledge_text = (matched_command.get("knowledge_text") or "").strip()
-            if routed_knowledge_text:
-                knowledge_query = normalize_query(routed_knowledge_text)
-            elif meta_request:
-                knowledge_query = ""
-            else:
-                knowledge_query = q
-            if knowledge_query and resolved_spacecraft:
-                knowledge_query = inject_spacecraft_context(knowledge_query, resolved_spacecraft)
-
-        if meta_request and not knowledge_query:
-            t3 = time.time()
-            meta_answer = generate_meta_answer(meta_request)
-            t4 = time.time()
-            return {
-                "transcript": transcript,
-                "query": q,
-                "intent": "info",
-                "client_command": None,
-                "meta_request": meta_request,
-                "answer": meta_answer,
-                "context_used": False,
-                "timing": {
-                    "asr": round(t1 - t0, 3),
-                    "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                    "transcribe": round(asr_stats["transcribe"], 3),
-                    "normalize": round(t2 - t1, 3),
-                    "meta_generate": round(t4 - t3, 3),
-                    "total": round(t4 - t0, 3),
-                },
-            }
-
-        topic_check_start = t2
-        off_topic = is_off_topic(knowledge_query)
-        t3 = time.time()
-        if off_topic and not (matched_command and matched_command["intent"] == "hybrid"):
-            answer = (
-                "Я отвечаю только по космонавтике из базы знаний. "
-                "Спроси, например: «Как устроены солнечные панели на Метеоре-М?»"
-            )
-            result = {
-                "transcript": transcript,
-                "query": q,
-                "intent": "off_topic",
-                "client_command": None,
-                "answer": answer,
-                "context_used": False,
-                "timing": {
-                    "asr": round(t1 - t0, 3),
-                    "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                    "transcribe": round(asr_stats["transcribe"], 3),
-                    "normalize": round(t2 - t1, 3),
-                    "topic_check": round(t3 - topic_check_start, 3),
-                    "total": round(t3 - t0, 3),
-                },
-            }
-            return result
-
-        t4 = time.time()
-        context, hits, retrieve_stats = retrieve_context(knowledge_query, initial_n=3, max_n=9)
-        t5 = time.time()
-        if not context:
-            t_fallback0 = time.time()
-            fallback_answer = generate_answer_fallback(knowledge_query, meta_request=meta_request)
-            t_fallback1 = time.time()
-            if fallback_answer != REFUSAL:
-                if matched_command and matched_command["intent"] == "hybrid":
-                    result = {
-                        "transcript": transcript,
-                        "query": q,
-                        "intent": "hybrid",
-                        "client_command": {
-                            "type": matched_command["type"],
-                        },
-                        "knowledge_query": knowledge_query,
-                        "answer": build_compound_answer(matched_command["answer"], fallback_answer),
-                        "context_used": False,
-                        "fallback_used": True,
-                        "timing": {
-                            "asr": round(t1 - t0, 3),
-                            "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                            "transcribe": round(asr_stats["transcribe"], 3),
-                            "normalize": round(t2 - t1, 3),
-                            "topic_check": round(t3 - topic_check_start, 3),
-                            "retrieve": round(t5 - t4, 3),
-                            "retrieve_embed": round(retrieve_stats["embed"], 3),
-                            "retrieve_search": round(retrieve_stats["search"], 3),
-                            "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                            "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                            "fallback_generate": round(t_fallback1 - t_fallback0, 3),
-                            "total": round(t_fallback1 - t0, 3),
-                        },
-                    }
-                    if meta_request:
-                        result["meta_request"] = meta_request
-                    return result
-                result = {
-                    "transcript": transcript,
-                    "query": q,
-                    "intent": "info",
-                    "client_command": None,
-                    "answer": fallback_answer,
-                    "context_used": False,
-                    "fallback_used": True,
-                    "timing": {
-                        "asr": round(t1 - t0, 3),
-                        "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                        "transcribe": round(asr_stats["transcribe"], 3),
-                        "normalize": round(t2 - t1, 3),
-                        "topic_check": round(t3 - topic_check_start, 3),
-                        "retrieve": round(t5 - t4, 3),
-                        "retrieve_embed": round(retrieve_stats["embed"], 3),
-                        "retrieve_search": round(retrieve_stats["search"], 3),
-                        "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                        "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                        "fallback_generate": round(t_fallback1 - t_fallback0, 3),
-                        "total": round(t_fallback1 - t0, 3),
-                    },
-                }
-                if meta_request:
-                    result["meta_request"] = meta_request
-                return result
-            if matched_command and matched_command["intent"] == "hybrid":
-                return {
-                    "transcript": transcript,
-                    "query": q,
-                    "intent": "hybrid",
-                    "client_command": {
-                        "type": matched_command["type"],
-                    },
-                    "knowledge_query": knowledge_query,
-                    "answer": build_compound_answer(matched_command["answer"], REFUSAL),
-                    "context_used": False,
-                    "timing": {
-                        "asr": round(t1 - t0, 3),
-                        "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                        "transcribe": round(asr_stats["transcribe"], 3),
-                        "normalize": round(t2 - t1, 3),
-                        "topic_check": round(t3 - topic_check_start, 3),
-                        "retrieve": round(t5 - t4, 3),
-                        "retrieve_embed": round(retrieve_stats["embed"], 3),
-                        "retrieve_search": round(retrieve_stats["search"], 3),
-                        "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                        "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                        "total": round(t5 - t0, 3),
-                    },
-                }
-            return {
-                "transcript": transcript,
-                "query": q,
-                "intent": "info",
-                "client_command": None,
-                "answer": REFUSAL,
-                "context_used": False,
-                "timing": {
-                    "asr": round(t1 - t0, 3),
-                    "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                    "transcribe": round(asr_stats["transcribe"], 3),
-                    "normalize": round(t2 - t1, 3),
-                    "topic_check": round(t3 - topic_check_start, 3),
-                    "retrieve": round(t5 - t4, 3),
-                    "retrieve_embed": round(retrieve_stats["embed"], 3),
-                    "retrieve_search": round(retrieve_stats["search"], 3),
-                    "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                    "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                    "total": round(t5 - t0, 3),
-                },
-            }
-
-        t6 = time.time()
-        if use_compact_generation():
-            answer = generate_answer_compact(knowledge_query, context, hits, meta_request=meta_request)
-        elif matched_command and matched_command["intent"] == "hybrid":
-            answer = generate_answer_compact(knowledge_query, context, hits, meta_request=meta_request)
-        else:
-            answer = generate_answer_strict(knowledge_query, context, hits, meta_request=meta_request)
-        t7 = time.time()
-        if answer == REFUSAL:
-            t_fallback0 = time.time()
-            fallback_answer = generate_answer_fallback(knowledge_query, meta_request=meta_request)
-            t_fallback1 = time.time()
-            if fallback_answer != REFUSAL:
-                if matched_command and matched_command["intent"] == "hybrid":
-                    result = {
-                        "transcript": transcript,
-                        "query": q,
-                        "intent": "hybrid",
-                        "client_command": {
-                            "type": matched_command["type"],
-                        },
-                        "knowledge_query": knowledge_query,
-                        "answer": build_compound_answer(matched_command["answer"], fallback_answer),
-                        "context_used": False,
-                        "fallback_used": True,
-                        "timing": {
-                            "asr": round(t1 - t0, 3),
-                            "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                            "transcribe": round(asr_stats["transcribe"], 3),
-                            "normalize": round(t2 - t1, 3),
-                            "topic_check": round(t3 - topic_check_start, 3),
-                            "retrieve": round(t5 - t4, 3),
-                            "retrieve_embed": round(retrieve_stats["embed"], 3),
-                            "retrieve_search": round(retrieve_stats["search"], 3),
-                            "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                            "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                            "generate": round(t7 - t6, 3),
-                            "fallback_generate": round(t_fallback1 - t_fallback0, 3),
-                            "total": round(t_fallback1 - t0, 3),
-                        },
-                    }
-                    if meta_request:
-                        result["meta_request"] = meta_request
-                    return result
-                result = {
-                    "transcript": transcript,
-                    "query": q,
-                    "intent": "info",
-                    "client_command": None,
-                    "answer": fallback_answer,
-                    "context_used": False,
-                    "fallback_used": True,
-                    "timing": {
-                        "asr": round(t1 - t0, 3),
-                        "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                        "transcribe": round(asr_stats["transcribe"], 3),
-                        "normalize": round(t2 - t1, 3),
-                        "topic_check": round(t3 - topic_check_start, 3),
-                        "retrieve": round(t5 - t4, 3),
-                        "retrieve_embed": round(retrieve_stats["embed"], 3),
-                        "retrieve_search": round(retrieve_stats["search"], 3),
-                        "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                        "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                        "generate": round(t7 - t6, 3),
-                        "fallback_generate": round(t_fallback1 - t_fallback0, 3),
-                        "total": round(t_fallback1 - t0, 3),
-                    },
-                }
-                if meta_request:
-                    result["meta_request"] = meta_request
-                return result
-        if matched_command and matched_command["intent"] == "hybrid":
-            return {
-                "transcript": transcript,
-                "query": q,
-                "intent": "hybrid",
-                "client_command": {
-                    "type": matched_command["type"],
-                },
-                "knowledge_query": knowledge_query,
-                "answer": build_compound_answer(matched_command["answer"], answer),
-                "context_used": (answer != REFUSAL),
-                "timing": {
-                    "asr": round(t1 - t0, 3),
-                    "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                    "transcribe": round(asr_stats["transcribe"], 3),
-                    "normalize": round(t2 - t1, 3),
-                    "topic_check": round(t3 - topic_check_start, 3),
-                    "retrieve": round(t5 - t4, 3),
-                    "retrieve_embed": round(retrieve_stats["embed"], 3),
-                    "retrieve_search": round(retrieve_stats["search"], 3),
-                    "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                    "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                    "generate": round(t7 - t6, 3),
-                    "total": round(t7 - t0, 3),
-                },
-            }
-        result = {
-            "transcript": transcript,
-            "query": q,
-            "intent": "info",
-            "client_command": None,
-            "answer": answer,
-            "context_used": (answer != REFUSAL),
-            "timing": {
-                "asr": round(t1 - t0, 3),
-                "audio_prepare": round(asr_stats["audio_prepare"], 3),
-                "transcribe": round(asr_stats["transcribe"], 3),
-                "normalize": round(t2 - t1, 3),
-                "topic_check": round(t3 - topic_check_start, 3),
-                "retrieve": round(t5 - t4, 3),
-                "retrieve_embed": round(retrieve_stats["embed"], 3),
-                "retrieve_search": round(retrieve_stats["search"], 3),
-                "retrieve_postprocess": round(retrieve_stats["postprocess"], 3),
-                "retrieve_context_build": round(retrieve_stats["context_build"], 3),
-                "generate": round(t7 - t6, 3),
-                "total": round(t7 - t0, 3),
-            },
+        base_timing = {
+            "asr": round(t1 - t0, 3),
+            "audio_prepare": round(asr_stats["audio_prepare"], 3),
+            "transcribe": round(asr_stats["transcribe"], 3),
+            "normalize": round(t2 - t1, 3),
         }
-        if meta_request:
-            result["meta_request"] = meta_request
-        return result
+        return _handle_query_core(transcript, q, spacecraft, t0, base_timing, transcript=transcript)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки аудио: {str(exc)}")
 
