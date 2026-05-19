@@ -1,7 +1,7 @@
 import os
 import time
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -32,7 +32,8 @@ from .query import (
     transcribe_audio_bytes_detailed,
 )
 from .runtime import collection, warmup
-from .auth import router as auth_router
+from .auth import router as auth_router, get_current_user
+from .models import User
 
 
 class QueryRequest(BaseModel):
@@ -323,7 +324,8 @@ def _handle_query_core(
         return _finalize(resp, base_timing, topic_timing, t_start, transcript)
 
     t_retr0 = time.time()
-    context, hits, rs = retrieve_context(knowledge_query, initial_n=3, max_n=9)
+    compact = use_compact_generation() or is_hybrid
+    context, hits, rs = retrieve_context(knowledge_query, initial_n=1 if compact else 3, max_n=3 if compact else 9)
     retr_timing = {
         "retrieve": round(time.time() - t_retr0, 3),
         "retrieve_embed": round(rs["embed"], 3),
@@ -389,7 +391,7 @@ def _handle_query_core(
 
 
 @app.post("/query")
-def handle_query(req: QueryRequest):
+def handle_query(req: QueryRequest, _: User = Depends(get_current_user)):
     try:
         t0 = time.time()
         raw = req.text or ""
@@ -405,7 +407,7 @@ def handle_query(req: QueryRequest):
 
 
 @app.post("/query_llm_only")
-def handle_query_llm_only(req: QueryRequest):
+def handle_query_llm_only(req: QueryRequest, _: User = Depends(get_current_user)):
     try:
         t0 = time.time()
         raw = req.text or ""
@@ -457,6 +459,7 @@ async def handle_query_audio(
     file: UploadFile = File(...),
     current_model_id: str | None = Form(None),
     current_spacecraft: str | None = Form(None),
+    _: User = Depends(get_current_user),
 ):
     try:
         audio_bytes = await file.read()
@@ -522,6 +525,26 @@ def download_model(model_id: str):
         filename=item["file_name"],
         media_type="application/octet-stream",
     )
+
+
+@app.get("/debug/cache")
+def debug_cache():
+    from .query.llm import _run_chat_generation_cached
+    info = _run_chat_generation_cached.cache_info()
+    total = info.hits + info.misses
+    return {
+        "hits": info.hits,
+        "misses": info.misses,
+        "maxsize": info.maxsize,
+        "currsize": info.currsize,
+        "hit_rate": round(info.hits / total, 3) if total > 0 else 0,
+    }
+
+
+@app.post("/debug/cache/clear", status_code=204)
+def clear_cache():
+    from .query.llm import _run_chat_generation_cached
+    _run_chat_generation_cached.cache_clear()
 
 
 @app.get("/debug/kb")

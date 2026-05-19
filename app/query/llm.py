@@ -1,6 +1,7 @@
 import json
 import urllib.error
 import urllib.request
+from functools import lru_cache
 
 import torch
 
@@ -180,12 +181,37 @@ def generate_with_yandex(
     return _extract_yandex_output_text(body)
 
 
+@lru_cache(maxsize=256)
+def _run_chat_generation_cached(messages_json: str, max_new_tokens: int, prompt_id: str | None) -> str:
+    messages = json.loads(messages_json)
+    if LLM_BACKEND == "vllm":
+        return generate_with_vllm(messages, max_new_tokens)
+    if LLM_BACKEND == "yandex":
+        return generate_with_yandex(messages, max_new_tokens, prompt_id=prompt_id, usage_label="cached")
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=LLM_MAX_INPUT_TOKENS).to(device)
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs, max_new_tokens=max_new_tokens, do_sample=False, use_cache=True,
+            pad_token_id=tokenizer.eos_token_id, eos_token_id=tokenizer.eos_token_id,
+        )
+    input_len = inputs.input_ids.shape[1]
+    return tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+
+
 def run_chat_generation(
     messages: list[dict],
     max_new_tokens: int,
     prompt_id: str | None = None,
     usage_label: str = "default",
 ) -> str:
+    if usage_label == "rag_compact":
+        return _run_chat_generation_cached(
+            json.dumps(messages, ensure_ascii=False, sort_keys=True),
+            max_new_tokens,
+            prompt_id,
+        )
+
     if LLM_BACKEND == "vllm":
         return generate_with_vllm(messages, max_new_tokens)
     if LLM_BACKEND == "yandex":

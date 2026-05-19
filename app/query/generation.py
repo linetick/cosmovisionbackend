@@ -227,18 +227,13 @@ def generate_answer_compact(
 
     user_parts: list[str] = []
     if meta_request:
-        user_parts.append(f"ВОПРОС О СИСТЕМЕ:\n{meta_request}")
-    user_parts.append(f"КОНТЕКСТ:\n{context}")
-    user_parts.append(f"ВОПРОС О КОСМИЧЕСКОМ АППАРАТЕ:\n{query}")
-    user_content = "\n\n".join(user_parts)
-    if meta_request:
-        user_content += (
-            "\n\nЕсли есть вопрос о системе, ответь на него из своей инструкции. "
-            "Факты о космическом аппарате бери только из блока КОНТЕКСТ."
-        )
+        user_parts.append(f"Система: {meta_request}")
+    user_parts.append(f"Контекст: {context}")
+    user_parts.append(f"Вопрос: {query}")
+    user_content = "\n".join(user_parts)
     if multi_entity:
-        user_content += "\n\nВ вопросе упомянуто несколько космических аппаратов. Если контекст позволяет, кратко ответь по каждому из них."
-    user_content += "\n\nОтветь одним коротким предложением."
+        user_content += "\nЕсли упомянуто несколько аппаратов — ответь по каждому кратко."
+    user_content += "\nОтвет (одно предложение):"
 
     if LLM_BACKEND == "yandex" and YANDEX_PROMPT_ID:
         messages = [

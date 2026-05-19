@@ -17,5 +17,6 @@ sqlalchemy>=2.0
 alembic
 psycopg2-binary
 python-jose[cryptography]
-passlib[bcrypt]
+passlib[argon2]
+argon2-cffi
 email-validator
