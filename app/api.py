@@ -27,6 +27,7 @@ from .query import (
     looks_like_client_command,
     looks_like_meta_request,
     normalize_query,
+    resolve_entity_nodes,
     retrieve_context,
     retrieve_hits,
     split_meta_and_knowledge_request,
@@ -52,13 +53,20 @@ def use_compact_generation() -> bool:
     return AR_COMPACT_RESPONSES
 
 
-def command_response(query: str, command_type: str, answer: str, intent: str = "action") -> dict:
+def command_response(
+    query: str,
+    command_type: str,
+    answer: str,
+    intent: str = "action",
+    target_nodes: list[str] | None = None,
+) -> dict:
+    cmd: dict = {"type": command_type}
+    if target_nodes:
+        cmd["target_nodes"] = target_nodes
     return {
         "query": query,
         "intent": intent,
-        "client_command": {
-            "type": command_type,
-        },
+        "client_command": cmd,
         "answer": answer,
         "context_used": False,
     }
@@ -127,6 +135,16 @@ def resolve_current_spacecraft(
     return spacecraft or None
 
 
+def resolve_scene(current_model_id: str | None = None) -> dict | None:
+    model_id = (current_model_id or "").strip()
+    if not model_id:
+        return None
+    item = get_model_metadata(model_id)
+    if not item:
+        return None
+    return item.get("scene") or None
+
+
 def resolve_client_command(query: str) -> tuple[dict | None, dict]:
     debug = {
         "normalized_query": query,
@@ -155,20 +173,26 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
         debug["llm_route"] = llm_route
         if llm_route["intent"] == "action":
             debug["resolution"] = "llm_action"
-            return {
+            route = {
                 "intent": "action",
                 "type": llm_route["command_type"],
                 "answer": COMMAND_ANSWERS[llm_route["command_type"]],
-            }, debug
+            }
+            if llm_route.get("entity_name"):
+                route["entity_name"] = llm_route["entity_name"]
+            return route, debug
         if llm_route["intent"] == "hybrid":
             debug["resolution"] = "llm_hybrid"
-            return {
+            route = {
                 "intent": "hybrid",
                 "type": llm_route["command_type"],
                 "answer": COMMAND_ANSWERS[llm_route["command_type"]],
                 "knowledge_text": (llm_route.get("knowledge_text") or "").strip() or None,
                 "meta_request": (llm_route.get("meta_request") or "").strip() or None,
-            }, debug
+            }
+            if llm_route.get("entity_name"):
+                route["entity_name"] = llm_route["entity_name"]
+            return route, debug
         if llm_route["intent"] == "unknown_command":
             marker_command = infer_client_command_from_markers(query)
             debug["marker_match"] = marker_command
@@ -253,6 +277,7 @@ def _handle_query_core(
     t_start: float,
     base_timing: dict,
     transcript: str | None = None,
+    scene: dict | None = None,
 ) -> dict:
     if spacecraft:
         q = inject_spacecraft_context(q, spacecraft)
@@ -266,8 +291,12 @@ def _handle_query_core(
     matched_command, _ = resolve_client_command(q)
 
     if matched_command and matched_command["intent"] == "action":
+        target_nodes = None
+        if matched_command["type"] == "highlight_entity" and scene:
+            entity_name = (matched_command.get("entity_name") or "").strip()
+            target_nodes = resolve_entity_nodes(entity_name if entity_name else q, scene)
         return _finalize(
-            command_response(q, matched_command["type"], matched_command["answer"]),
+            command_response(q, matched_command["type"], matched_command["answer"], target_nodes=target_nodes),
             base_timing, {}, t_start, transcript,
         )
 
@@ -324,6 +353,8 @@ def _handle_query_core(
         }
         return _finalize(resp, base_timing, topic_timing, t_start, transcript)
 
+    is_hybrid = bool(matched_command and matched_command["intent"] == "hybrid")
+
     t_retr0 = time.time()
     compact = use_compact_generation() or is_hybrid
     context, hits, rs = retrieve_context(knowledge_query, initial_n=1 if compact else 3, max_n=3 if compact else 9)
@@ -335,13 +366,17 @@ def _handle_query_core(
         "retrieve_context_build": round(rs["context_build"], 3),
     }
 
-    is_hybrid = bool(matched_command and matched_command["intent"] == "hybrid")
-
     def _result(answer: str, context_used: bool, extra: dict | None = None) -> dict:
         if is_hybrid:
+            cmd: dict = {"type": matched_command["type"]}
+            if matched_command["type"] == "highlight_entity" and scene:
+                entity_name = (matched_command.get("entity_name") or "").strip()
+                target_nodes = resolve_entity_nodes(entity_name if entity_name else q, scene)
+                if target_nodes:
+                    cmd["target_nodes"] = target_nodes
             r = {
                 "query": q, "intent": "hybrid",
-                "client_command": {"type": matched_command["type"]},
+                "client_command": cmd,
                 "knowledge_query": knowledge_query,
                 "answer": build_compound_answer(matched_command["answer"], answer),
                 "context_used": context_used,
@@ -402,7 +437,8 @@ def handle_query(req: QueryRequest, _: User = Depends(get_current_user)):
             current_model_id=req.current_model_id,
             current_spacecraft=req.current_spacecraft,
         )
-        return _handle_query_core(raw, q, spacecraft, t0, {"normalize": round(t1 - t0, 3)})
+        scene = resolve_scene(current_model_id=req.current_model_id)
+        return _handle_query_core(raw, q, spacecraft, t0, {"normalize": round(t1 - t0, 3)}, scene=scene)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(exc)}")
 
@@ -484,13 +520,14 @@ async def handle_query_audio(
             current_model_id=current_model_id,
             current_spacecraft=current_spacecraft,
         )
+        scene = resolve_scene(current_model_id=current_model_id)
         base_timing = {
             "asr": round(t1 - t0, 3),
             "audio_prepare": round(asr_stats["audio_prepare"], 3),
             "transcribe": round(asr_stats["transcribe"], 3),
             "normalize": round(t2 - t1, 3),
         }
-        return _handle_query_core(transcript, q, spacecraft, t0, base_timing, transcript=transcript)
+        return _handle_query_core(transcript, q, spacecraft, t0, base_timing, transcript=transcript, scene=scene)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки аудио: {str(exc)}")
 

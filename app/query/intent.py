@@ -35,6 +35,12 @@ COMMAND_PHRASES = {
         "запусти анимацию", "включи анимацию", "анимация", "оживи спутник",
         "анимируй спутник", "запусти движение", "включи движение",
     ),
+    "highlight_entity": (
+        "подсвети", "подсветить",
+        "выдели", "выделить",
+        "покажи деталь", "обозначь",
+        "укажи деталь", "выдели деталь",
+    ),
 }
 
 COMMAND_ANSWERS = {
@@ -44,6 +50,7 @@ COMMAND_ANSWERS = {
     "decrease_scale": "Уменьшаю модель.",
     "reset_view": "Возвращаю исходный вид модели.",
     "play_animation": "Запускаю анимацию спутника.",
+    "highlight_entity": "Подсвечиваю элемент.",
 }
 
 COMMAND_LIKE_MARKERS = (
@@ -51,6 +58,7 @@ COMMAND_LIKE_MARKERS = (
     "увелич", "приблиз", "уменьш", "отдал",
     "сброс", "верни обратно", "исходный вид",
     "анимац", "анимир", "оживи", "движени",
+    "подсвет", "выдел", "обозначь",
 )
 
 COMMAND_TYPES = tuple(COMMAND_PHRASES.keys())
@@ -61,6 +69,7 @@ COMMAND_MARKER_GROUPS = (
     ("increase_scale", ("увелич", "приблиз", "больше")),
     ("decrease_scale", ("уменьш", "отдал", "меньше")),
     ("reset_view", ("сброс", "исходный вид", "верни обратно", "как было")),
+    ("highlight_entity", ("подсвет", "выдел", "обозначь", "укажи деталь")),
     ("start_rotation", ("вращ", "крут", "верт", "поверн", "разверн")),
 )
 
@@ -274,6 +283,61 @@ def has_command_markers(query: str) -> bool:
     return detect_client_command(query) is not None or looks_like_client_command(query)
 
 
+def _word_start_match(pattern: str, text: str) -> bool:
+    """True if pattern appears in text at a word-start boundary (preceded by space or start)."""
+    pos = 0
+    while True:
+        idx = text.find(pattern, pos)
+        if idx == -1:
+            return False
+        if idx == 0 or not text[idx - 1].isalpha():
+            return True
+        pos = idx + 1
+
+
+def _alias_in_query(alias: str, query: str) -> bool:
+    a = alias.lower()
+    q = query.lower()
+    # Try full alias, then stems dropping 1-3 chars for Russian declension
+    candidates = [a]
+    for drop in (1, 2, 3):
+        stem = a[:-drop]
+        if len(stem) >= 4:
+            candidates.append(stem)
+    for candidate in candidates:
+        if _word_start_match(candidate, q):
+            return True
+    # For multi-word aliases: require ALL words to match somewhere in query
+    # (handles declined forms, e.g. "верхняя полусфера" → "верхнюю полусферу")
+    words = a.split()
+    if len(words) >= 2:
+        def _word_in_query(w: str) -> bool:
+            wcands = [w] + [w[:-d] for d in (1, 2, 3) if len(w) - d >= 4]
+            return any(_word_start_match(c, q) for c in wcands)
+        if all(_word_in_query(w) for w in words):
+            return True
+    return False
+
+
+def resolve_entity_nodes(query: str, scene: dict) -> list[str] | None:
+    """Match entity aliases from scene against query, return bone nodes for the best match."""
+    if not scene or not query:
+        return None
+    entities = scene.get("entities", {})
+    q = query.lower()
+    best: tuple[int, list[str]] | None = None  # (alias_len, nodes)
+    for entity_data in entities.values():
+        nodes = entity_data.get("nodes", [])
+        if not nodes:
+            continue
+        for alias in entity_data.get("aliases", []):
+            if _alias_in_query(alias, q):
+                length = len(alias)
+                if best is None or length > best[0]:
+                    best = (length, nodes)
+    return best[1] if best else None
+
+
 def _extract_json_object(text: str) -> dict | None:
     if not text:
         return None
@@ -333,6 +397,10 @@ def classify_query_with_llm(query: str) -> dict | None:
             return None
 
         route = {"intent": intent, "command_type": command_type}
+        if command_type == "highlight_entity":
+            entity_name = (parsed.get("entity_name") or "").strip()
+            if entity_name:
+                route["entity_name"] = entity_name
         if intent == "hybrid":
             knowledge_text = (parsed.get("knowledge_text") or "").strip()
             route["knowledge_text"] = knowledge_text or ""
@@ -441,6 +509,10 @@ def classify_query_with_llm(query: str) -> dict | None:
         return None
 
     route = {"intent": intent, "command_type": command_type}
+    if command_type == "highlight_entity":
+        entity_name = (parsed.get("entity_name") or "").strip()
+        if entity_name:
+            route["entity_name"] = entity_name
     if intent == "hybrid":
         knowledge_text = (parsed.get("knowledge_text") or "").strip()
         route["knowledge_text"] = knowledge_text or ""

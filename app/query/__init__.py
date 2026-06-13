@@ -17,6 +17,7 @@ from .intent import (
     looks_like_knowledge_request,
     looks_like_meta_request,
     normalize_query,
+    resolve_entity_nodes,
     split_meta_and_knowledge_request,
 )
 from .retrieval import build_context_from_hits, retrieve_context, retrieve_hits
@@ -41,6 +42,7 @@ __all__ = [
     "looks_like_knowledge_request",
     "looks_like_meta_request",
     "normalize_query",
+    "resolve_entity_nodes",
     "retrieve_context",
     "retrieve_hits",
     "split_meta_and_knowledge_request",
