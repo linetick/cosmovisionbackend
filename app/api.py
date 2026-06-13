@@ -2,6 +2,7 @@ import os
 import time
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -473,7 +474,9 @@ async def handle_query_audio(
             }
 
         t0 = time.time()
-        transcript, asr_stats = transcribe_audio_bytes_detailed(audio_bytes, language="ru")
+        transcript, asr_stats = await run_in_threadpool(
+            transcribe_audio_bytes_detailed, audio_bytes, language="ru"
+        )
         t1 = time.time()
         q = normalize_query(transcript)
         t2 = time.time()

@@ -12,7 +12,13 @@ DATABASE_URL = os.getenv(
     "postgresql://postgres:postgres@localhost:5432/cosmovision",
 )
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=100,
+    max_overflow=400,
+    pool_timeout=60,
+)
 
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
@@ -22,4 +28,7 @@ def get_db():
     try:
         yield db
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass

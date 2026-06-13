@@ -113,26 +113,28 @@ else:
         model = model.to("cpu")
     model.eval()
 
-whisper_model = None
+WHISPER_WORKERS = int(os.getenv("WHISPER_WORKERS", "4"))
+_whisper_model: WhisperModel | None = None
 
 
 def get_whisper_model() -> WhisperModel:
-    global whisper_model
-    if whisper_model is None:
-        print(f"Загрузка Whisper ({WHISPER_MODEL_ID}) на {WHISPER_DEVICE}...")
-        whisper_model = WhisperModel(
+    global _whisper_model
+    if _whisper_model is None:
+        print(f"Загрузка Whisper ({WHISPER_MODEL_ID}) на {WHISPER_DEVICE} (workers={WHISPER_WORKERS})...")
+        _whisper_model = WhisperModel(
             WHISPER_MODEL_ID,
             device=WHISPER_DEVICE,
             compute_type=WHISPER_COMPUTE_TYPE,
+            num_workers=WHISPER_WORKERS,
         )
-    return whisper_model
+        print("✅ Whisper загружен.")
+    return _whisper_model
 
 
 def preload_whisper() -> None:
     if not WHISPER_PRELOAD:
         print("Предзагрузка Whisper отключена.")
         return
-
     try:
         get_whisper_model()
         print("✅ Whisper предзагружен.")

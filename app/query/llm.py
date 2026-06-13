@@ -205,7 +205,7 @@ def run_chat_generation(
     prompt_id: str | None = None,
     usage_label: str = "default",
 ) -> str:
-    if usage_label == "rag_compact":
+    if usage_label in ("rag_compact", "router"):
         return _run_chat_generation_cached(
             json.dumps(messages, ensure_ascii=False, sort_keys=True),
             max_new_tokens,

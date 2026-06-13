@@ -1,0 +1,42 @@
+@startuml
+title Диаграмма развёртывания системы CosmoVision
+
+left to right direction
+skinparam shadowing false
+skinparam defaultFontName Arial
+
+node "Мобильное устройство" as Mobile {
+  artifact "AR-приложение\n(Unity + AR Foundation)" as ClientApp
+}
+
+cloud "Сеть" as Network
+
+node "Сервер приложений" as AppServer {
+  artifact "Backend-приложение\n(FastAPI)" as Backend
+  artifact "Модуль аутентификации\n(JWT)" as Auth
+  artifact "Модуль распознавания речи\n(faster-whisper, pool)" as Whisper
+}
+
+cloud "Yandex Cloud" as YandexCloud {
+  artifact "Классификатор интентов\n(gpt-oss-20b)" as Router
+  artifact "Генерация ответа\n(Qwen3.6-35B)" as LLMService
+}
+
+database "База знаний\n(ChromaDB)" as KnowledgeBase
+database "База данных\n(PostgreSQL)" as PostgresDB
+folder "Хранилище 3D-моделей\n(файлы .fbx)" as Models
+
+ClientApp --> Network
+Network --> Backend : HTTP/HTTPS\nJSON, аудиофайлы
+
+Backend --> Auth : проверка токена
+Backend -l-> Whisper : распознавание речи
+Backend --> KnowledgeBase : семантический поиск
+Backend --> Router : классификация интента
+Backend --> LLMService : генерация ответа
+Backend --> PostgresDB : пользователи,\nметаданные спутников
+Backend --> Models : файлы 3D-моделей
+
+Backend --> ClientApp : текстовый ответ,\nкоманды, данные модели
+
+@enduml
