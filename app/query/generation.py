@@ -1,4 +1,5 @@
 import re
+from typing import Iterator
 
 from ..config import (
     LLM_BACKEND,
@@ -9,7 +10,7 @@ from ..config import (
     SHORT_RAG_MAX_CONTEXT_CHARS,
     YANDEX_PROMPT_ID,
 )
-from .llm import run_chat_generation
+from .llm import generate_with_yandex_stream, run_chat_generation
 from .retrieval import build_context_from_hits
 from .text_utils import (
     find_extractive_answer,
@@ -109,7 +110,7 @@ def generate_answer_fallback(query: str, meta_request: str | None = None) -> str
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"^ответ:\s*", "", text, flags=re.IGNORECASE)
     if not text or len(text) < 3:
-        return REFUSAL
+        return "В базе знаний нет информации по этому вопросу. Ответ может быть неточным."
     return text
 
 
@@ -118,6 +119,7 @@ def generate_answer_strict(
     context: str,
     hits: list[dict] | None = None,
     meta_request: str | None = None,
+    history: list[dict] | None = None,
 ) -> str:
     brief_answer = wants_brief_answer(query)
     meta_request = (meta_request or "").strip() or None
@@ -166,9 +168,7 @@ def generate_answer_strict(
             user_content += "\n\nОтветь одним коротким предложением без вводных слов."
 
     if LLM_BACKEND == "yandex" and YANDEX_PROMPT_ID:
-        messages = [
-            {"role": "user", "content": user_content},
-        ]
+        messages = [*(history or []), {"role": "user", "content": user_content}]
     else:
         system = (
             "Ты — ИИ-ассистент по космонавтике с RAG.\n"
@@ -177,10 +177,7 @@ def generate_answer_strict(
             "Если в запросе есть вопрос о системе, отвечай на него из своей инструкции, а не из контекста.\n"
             f"Если в контексте нет ответа, верни ровно: {REFUSAL}"
         )
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_content},
-        ]
+        messages = [{"role": "system", "content": system}, *(history or []), {"role": "user", "content": user_content}]
 
     max_new_tokens = SHORT_LLM_MAX_NEW_TOKENS if brief_answer else LLM_MAX_NEW_TOKENS
     text = run_chat_generation(messages, max_new_tokens, usage_label="rag_strict")
@@ -198,6 +195,7 @@ def generate_answer_compact(
     context: str,
     hits: list[dict] | None = None,
     meta_request: str | None = None,
+    history: list[dict] | None = None,
 ) -> str:
     meta_request = (meta_request or "").strip() or None
     multi_entity = is_multi_entity_query(query)
@@ -236,9 +234,7 @@ def generate_answer_compact(
     user_content += "\nОтвет (одно предложение):"
 
     if LLM_BACKEND == "yandex" and YANDEX_PROMPT_ID:
-        messages = [
-            {"role": "user", "content": user_content},
-        ]
+        messages = [*(history or []), {"role": "user", "content": user_content}]
     else:
         system = (
             "Ты — ИИ-ассистент по космонавтике с RAG.\n"
@@ -248,10 +244,7 @@ def generate_answer_compact(
             "Ответ должен быть кратким: одно короткое содержательное предложение без вводных слов.\n"
             f"Если в контексте нет ответа, верни ровно: {REFUSAL}"
         )
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_content},
-        ]
+        messages = [{"role": "system", "content": system}, *(history or []), {"role": "user", "content": user_content}]
 
     text = run_chat_generation(messages, SHORT_LLM_MAX_NEW_TOKENS, usage_label="rag_compact")
     text = re.sub(r"\s+", " ", text).strip()
@@ -261,3 +254,44 @@ def generate_answer_compact(
     if is_refusal_like(text):
         return REFUSAL
     return squeeze_to_one_sentence(text)
+
+
+def generate_answer_stream(
+    query: str,
+    context: str,
+    meta_request: str | None = None,
+    history: list[dict] | None = None,
+) -> Iterator[str]:
+    """Стримит ответ токенами. Yandex — нативный SSE, остальные — пословно."""
+    meta_request = (meta_request or "").strip() or None
+
+    if not context.strip():
+        yield REFUSAL
+        return
+
+    user_parts: list[str] = []
+    if meta_request:
+        user_parts.append(f"ВОПРОС О СИСТЕМЕ:\n{meta_request}")
+    user_parts.append(f"КОНТЕКСТ:\n{context}")
+    user_parts.append(f"ВОПРОС О КОСМИЧЕСКОМ АППАРАТЕ:\n{query}")
+    user_content = "\n\n".join(user_parts)
+
+    if LLM_BACKEND == "yandex" and YANDEX_PROMPT_ID:
+        messages = [*(history or []), {"role": "user", "content": user_content}]
+        yield from generate_with_yandex_stream(messages, LLM_MAX_NEW_TOKENS, prompt_id=YANDEX_PROMPT_ID)
+        return
+
+    system = (
+        "Ты — ИИ-ассистент по космонавтике с RAG.\n"
+        "Отвечай только по фрагментам базы знаний из блока КОНТЕКСТ.\n"
+        f"Если в контексте нет ответа, верни ровно: {REFUSAL}"
+    )
+    messages = [{"role": "system", "content": system}, *(history or []), {"role": "user", "content": user_content}]
+    full = run_chat_generation(messages, LLM_MAX_NEW_TOKENS, usage_label="stream")
+    full = re.sub(r"\s+", " ", full).strip()
+    if not full or len(full) < 3:
+        yield REFUSAL
+        return
+    for word in full.split(" "):
+        if word:
+            yield word + " "

@@ -1,9 +1,10 @@
+import json
 import os
 import time
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .config import AR_COMPACT_RESPONSES, APP_TITLE, APP_VERSION, DB_PATH, MODEL_FILES_DIR, MODEL_REGISTRY_PATH, REFUSAL
@@ -18,6 +19,7 @@ from .query import (
     generate_answer_compact,
     generate_answer_fallback,
     generate_answer_llm_only,
+    generate_answer_stream,
     generate_answer_strict,
     has_sufficient_context_relevance,
     infer_client_command_from_markers,
@@ -35,6 +37,9 @@ from .query import (
 )
 from .runtime import collection, warmup
 from .auth import router as auth_router, get_current_user
+from .database import SessionLocal, get_db
+from .models import Message as DBMessage
+from .models import Session as DBSession
 from .models import User
 
 
@@ -42,6 +47,8 @@ class QueryRequest(BaseModel):
     text: str
     current_model_id: str | None = None
     current_spacecraft: str | None = None
+    stream: bool = False
+    session_id: int | None = None
 
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
@@ -278,6 +285,7 @@ def _handle_query_core(
     base_timing: dict,
     transcript: str | None = None,
     scene: dict | None = None,
+    history: list[dict] | None = None,
 ) -> dict:
     if spacecraft:
         q = inject_spacecraft_context(q, spacecraft)
@@ -342,7 +350,8 @@ def _handle_query_core(
     off_topic = is_off_topic(knowledge_query)
     topic_timing = {"topic_check": round(time.time() - t_topic0, 3)}
 
-    if off_topic and not (matched_command and matched_command["intent"] == "hybrid"):
+    # В рамках активной сессии follow-up вопросы не блокируем
+    if off_topic and not (matched_command and matched_command["intent"] == "hybrid") and not history:
         resp = {
             "query": q, "intent": "off_topic", "client_command": None,
             "answer": (
@@ -393,52 +402,175 @@ def _handle_query_core(
         t_fb0 = time.time()
         fallback_answer = generate_answer_fallback(knowledge_query, meta_request=meta_request)
         fb_timing = {"fallback_generate": round(time.time() - t_fb0, 3)}
-        if fallback_answer != REFUSAL:
-            return _finalize(
-                _result(fallback_answer, False, {"fallback_used": True}),
-                base_timing, {**topic_timing, **retr_timing, **fb_timing}, t_start, transcript,
-            )
         return _finalize(
-            _result(REFUSAL, False),
-            base_timing, {**topic_timing, **retr_timing}, t_start, transcript,
+            _result(fallback_answer, False, {"fallback_used": True}),
+            base_timing, {**topic_timing, **retr_timing, **fb_timing}, t_start, transcript,
         )
 
     t_gen0 = time.time()
     if use_compact_generation() or is_hybrid:
-        answer = generate_answer_compact(knowledge_query, context, hits, meta_request=meta_request)
+        answer = generate_answer_compact(knowledge_query, context, hits, meta_request=meta_request, history=history)
     else:
-        answer = generate_answer_strict(knowledge_query, context, hits, meta_request=meta_request)
+        answer = generate_answer_strict(knowledge_query, context, hits, meta_request=meta_request, history=history)
     gen_timing = {"generate": round(time.time() - t_gen0, 3)}
 
     if answer == REFUSAL:
         t_fb0 = time.time()
         fallback_answer = generate_answer_fallback(knowledge_query, meta_request=meta_request)
         fb_timing = {"fallback_generate": round(time.time() - t_fb0, 3)}
-        if fallback_answer != REFUSAL:
-            return _finalize(
-                _result(fallback_answer, False, {"fallback_used": True}),
-                base_timing, {**topic_timing, **retr_timing, **gen_timing, **fb_timing}, t_start, transcript,
-            )
+        return _finalize(
+            _result(fallback_answer, False, {"fallback_used": True}),
+            base_timing, {**topic_timing, **retr_timing, **gen_timing, **fb_timing}, t_start, transcript,
+        )
 
     return _finalize(
-        _result(answer, answer != REFUSAL),
+        _result(answer, True),
         base_timing, {**topic_timing, **retr_timing, **gen_timing}, t_start, transcript,
     )
 
 
+def _load_history(session_id: int, user_id: int, db) -> list[dict]:
+    """Загружает последние 10 сообщений сессии для передачи в LLM."""
+    sess = db.query(DBSession).filter(DBSession.id == session_id, DBSession.user_id == user_id).first()
+    if not sess:
+        return []
+    msgs = (
+        db.query(DBMessage)
+        .filter(DBMessage.session_id == session_id)
+        .order_by(DBMessage.created_at)
+        .all()
+    )
+    return [{"role": m.role, "content": m.content} for m in msgs[-10:]]
+
+
+def _save_exchange(session_id: int, user_text: str, assistant_text: str, intent: str, db) -> None:
+    """Сохраняет пару user+assistant сообщений в сессию."""
+    db.add(DBMessage(session_id=session_id, role="user", content=user_text, intent=intent))
+    db.add(DBMessage(session_id=session_id, role="assistant", content=assistant_text, intent=intent))
+    db.commit()
+
+
+def _make_sse_stream(q: str, spacecraft: str | None, scene: dict | None, transcript: str | None = None, history: list[dict] | None = None):
+    """Генератор SSE-событий для стримингового ответа."""
+    qs = inject_spacecraft_context(q, spacecraft) if spacecraft else q
+    matched_command, _ = resolve_client_command(qs)
+
+    intent = "info"
+    client_cmd = None
+    if matched_command:
+        mv = matched_command["intent"]
+        if mv in ("action", "hybrid"):
+            intent = mv
+            target_nodes = None
+            if matched_command["type"] == "highlight_entity" and scene:
+                entity_name = (matched_command.get("entity_name") or "").strip()
+                target_nodes = resolve_entity_nodes(entity_name if entity_name else qs, scene)
+            client_cmd = {"type": matched_command["type"]}
+            if target_nodes:
+                client_cmd["target_nodes"] = target_nodes
+        elif mv == "unknown_command":
+            intent = "unknown_command"
+
+    meta: dict = {"type": "meta", "intent": intent, "client_command": client_cmd}
+    if transcript is not None:
+        meta["transcript"] = transcript
+    yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
+
+    if intent == "action":
+        answer = matched_command["answer"] if matched_command else REFUSAL
+        yield f"data: {json.dumps({'type': 'token', 'text': answer}, ensure_ascii=False)}\n\n"
+        yield "data: {\"type\":\"done\"}\n\n"
+        return
+
+    if intent == "unknown_command":
+        yield "data: {\"type\":\"token\",\"text\":\"Команда не распознана.\"}\n\n"
+        yield "data: {\"type\":\"done\"}\n\n"
+        return
+
+    knowledge_query = qs
+    meta_request = None
+    if matched_command:
+        meta_request = normalize_query((matched_command.get("meta_request") or "").strip()) or None
+        if intent == "hybrid":
+            knowledge_query = (matched_command.get("knowledge_text") or "").strip()
+            if not knowledge_query:
+                knowledge_query = extract_knowledge_query_from_compound(
+                    qs, matched_command["type"], current_spacecraft=spacecraft,
+                )
+            else:
+                knowledge_query = normalize_query(knowledge_query)
+                if spacecraft:
+                    knowledge_query = inject_spacecraft_context(knowledge_query, spacecraft)
+        elif intent == "info":
+            routed = (matched_command.get("knowledge_text") or "").strip()
+            if routed:
+                knowledge_query = normalize_query(routed)
+            if knowledge_query and spacecraft:
+                knowledge_query = inject_spacecraft_context(knowledge_query, spacecraft)
+
+    if intent == "hybrid" and matched_command:
+        yield f"data: {json.dumps({'type': 'token', 'text': matched_command['answer'] + ' '}, ensure_ascii=False)}\n\n"
+
+    context, hits, _ = retrieve_context(knowledge_query, initial_n=1, max_n=3)
+
+    if not context:
+        fallback = generate_answer_fallback(knowledge_query, meta_request=meta_request)
+        yield f"data: {json.dumps({'type': 'token', 'text': fallback}, ensure_ascii=False)}\n\n"
+        yield "data: {\"type\":\"done\"}\n\n"
+        return
+
+    for chunk in generate_answer_stream(knowledge_query, context, meta_request=meta_request, history=history):
+        yield f"data: {json.dumps({'type': 'token', 'text': chunk}, ensure_ascii=False)}\n\n"
+
+    yield "data: {\"type\":\"done\"}\n\n"
+
+
 @app.post("/query")
-def handle_query(req: QueryRequest, _: User = Depends(get_current_user)):
+def handle_query(req: QueryRequest, user: User = Depends(get_current_user), db=Depends(get_db)):
+    raw = req.text or ""
+    q = normalize_query(raw)
+    spacecraft = resolve_current_spacecraft(
+        current_model_id=req.current_model_id,
+        current_spacecraft=req.current_spacecraft,
+    )
+    scene = resolve_scene(current_model_id=req.current_model_id)
+
+    session_id = req.session_id if (req.session_id and user.id > 0) else None
+    history = _load_history(session_id, user.id, db) if session_id else []
+
+    if req.stream:
+        def stream_and_save():
+            collected: list[str] = []
+            final_intent: list[str] = ["info"]
+            for event in _make_sse_stream(q, spacecraft, scene, history=history):
+                yield event
+                if event.startswith("data:"):
+                    try:
+                        data = json.loads(event[5:].strip())
+                        if data.get("type") == "token":
+                            collected.append(data.get("text", ""))
+                        elif data.get("type") == "meta":
+                            final_intent[0] = data.get("intent", "info")
+                    except Exception:
+                        pass
+            if session_id:
+                save_db = SessionLocal()
+                try:
+                    _save_exchange(session_id, raw, "".join(collected), final_intent[0], save_db)
+                except Exception:
+                    pass
+                finally:
+                    save_db.close()
+
+        return StreamingResponse(stream_and_save(), media_type="text/event-stream")
+
     try:
         t0 = time.time()
-        raw = req.text or ""
-        q = normalize_query(raw)
         t1 = time.time()
-        spacecraft = resolve_current_spacecraft(
-            current_model_id=req.current_model_id,
-            current_spacecraft=req.current_spacecraft,
-        )
-        scene = resolve_scene(current_model_id=req.current_model_id)
-        return _handle_query_core(raw, q, spacecraft, t0, {"normalize": round(t1 - t0, 3)}, scene=scene)
+        result = _handle_query_core(raw, q, spacecraft, t0, {"normalize": round(t1 - t0, 3)}, scene=scene, history=history)
+        if session_id:
+            _save_exchange(session_id, raw, result.get("answer", ""), result.get("intent", "info"), db)
+        return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(exc)}")
 
@@ -496,11 +628,20 @@ async def handle_query_audio(
     file: UploadFile = File(...),
     current_model_id: str | None = Form(None),
     current_spacecraft: str | None = Form(None),
-    _: User = Depends(get_current_user),
+    stream: bool = Form(False),
+    session_id: int | None = Form(None),
+    user: User = Depends(get_current_user),
+    db=Depends(get_db),
 ):
     try:
         audio_bytes = await file.read()
         if not audio_bytes:
+            if stream:
+                def _empty():
+                    yield f"data: {json.dumps({'type': 'meta', 'intent': 'info', 'client_command': None, 'transcript': ''}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'type': 'token', 'text': REFUSAL}, ensure_ascii=False)}\n\n"
+                    yield "data: {\"type\":\"done\"}\n\n"
+                return StreamingResponse(_empty(), media_type="text/event-stream")
             return {
                 "answer": REFUSAL,
                 "intent": "info",
@@ -521,13 +662,46 @@ async def handle_query_audio(
             current_spacecraft=current_spacecraft,
         )
         scene = resolve_scene(current_model_id=current_model_id)
+
+        sid = session_id if (session_id and user.id > 0) else None
+        history = _load_history(sid, user.id, db) if sid else []
+
+        if stream:
+            def stream_and_save():
+                collected: list[str] = []
+                final_intent: list[str] = ["info"]
+                for event in _make_sse_stream(q, spacecraft, scene, transcript=transcript, history=history):
+                    yield event
+                    if event.startswith("data:"):
+                        try:
+                            data = json.loads(event[5:].strip())
+                            if data.get("type") == "token":
+                                collected.append(data.get("text", ""))
+                            elif data.get("type") == "meta":
+                                final_intent[0] = data.get("intent", "info")
+                        except Exception:
+                            pass
+                if sid:
+                    save_db = SessionLocal()
+                    try:
+                        _save_exchange(sid, transcript, "".join(collected), final_intent[0], save_db)
+                    except Exception:
+                        pass
+                    finally:
+                        save_db.close()
+
+            return StreamingResponse(stream_and_save(), media_type="text/event-stream")
+
         base_timing = {
             "asr": round(t1 - t0, 3),
             "audio_prepare": round(asr_stats["audio_prepare"], 3),
             "transcribe": round(asr_stats["transcribe"], 3),
             "normalize": round(t2 - t1, 3),
         }
-        return _handle_query_core(transcript, q, spacecraft, t0, base_timing, transcript=transcript, scene=scene)
+        result = _handle_query_core(transcript, q, spacecraft, t0, base_timing, transcript=transcript, scene=scene, history=history)
+        if sid:
+            _save_exchange(sid, transcript, result.get("answer", ""), result.get("intent", "info"), db)
+        return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки аудио: {str(exc)}")
 
@@ -695,6 +869,93 @@ def debug_command(req: QueryRequest):
         "total": round(time.time() - t0, 3),
     }
     return result
+
+
+
+@app.post("/sessions", status_code=201)
+def create_session(
+    current_model_id: str | None = None,
+    user: User = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    if user.id == 0:
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+    sess = DBSession(user_id=user.id, spacecraft_id=current_model_id)
+    db.add(sess)
+    db.commit()
+    db.refresh(sess)
+    return {"id": sess.id, "spacecraft_id": sess.spacecraft_id, "created_at": sess.created_at}
+
+
+@app.get("/sessions")
+def list_sessions(user: User = Depends(get_current_user), db=Depends(get_db)):
+    if user.id == 0:
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+    sessions = (
+        db.query(DBSession)
+        .filter(DBSession.user_id == user.id)
+        .order_by(DBSession.updated_at.desc())
+        .limit(50)
+        .all()
+    )
+    items = []
+    for s in sessions:
+        last = (
+            db.query(DBMessage)
+            .filter(DBMessage.session_id == s.id)
+            .order_by(DBMessage.created_at.desc())
+            .first()
+        )
+        items.append({
+            "id": s.id,
+            "spacecraft_id": s.spacecraft_id,
+            "created_at": s.created_at,
+            "updated_at": s.updated_at,
+            "last_message": last.content[:80] if last else None,
+        })
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/sessions/{session_id}/messages")
+def get_session_messages(
+    session_id: int,
+    user: User = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    if user.id == 0:
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+    sess = db.query(DBSession).filter(DBSession.id == session_id, DBSession.user_id == user.id).first()
+    if not sess:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    msgs = (
+        db.query(DBMessage)
+        .filter(DBMessage.session_id == session_id)
+        .order_by(DBMessage.created_at)
+        .all()
+    )
+    return {
+        "session_id": session_id,
+        "spacecraft_id": sess.spacecraft_id,
+        "messages": [
+            {"id": m.id, "role": m.role, "content": m.content, "intent": m.intent, "created_at": m.created_at}
+            for m in msgs
+        ],
+    }
+
+
+@app.delete("/sessions/{session_id}", status_code=204)
+def delete_session(
+    session_id: int,
+    user: User = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    if user.id == 0:
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+    sess = db.query(DBSession).filter(DBSession.id == session_id, DBSession.user_id == user.id).first()
+    if not sess:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    db.delete(sess)
+    db.commit()
 
 
 warmup(retrieve_hits, generate_answer_strict)

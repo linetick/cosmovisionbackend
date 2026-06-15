@@ -3,6 +3,7 @@ from .generation import (
     generate_answer_compact,
     generate_answer_fallback,
     generate_answer_llm_only,
+    generate_answer_stream,
     generate_answer_strict,
 )
 from .intent import (
@@ -33,6 +34,7 @@ __all__ = [
     "generate_answer_compact",
     "generate_answer_fallback",
     "generate_answer_llm_only",
+    "generate_answer_stream",
     "generate_answer_strict",
     "has_sufficient_context_relevance",
     "infer_client_command_from_markers",

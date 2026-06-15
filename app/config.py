@@ -25,6 +25,7 @@ APP_TITLE = "CosmoVision AI Backend"
 APP_VERSION = "2.1"
 REFUSAL = "В предоставленных данных нет информации."
 AR_COMPACT_RESPONSES = os.getenv("AR_COMPACT_RESPONSES", "1").strip().lower() not in {"0", "false", "no"}
+AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "1").strip().lower() not in {"0", "false", "no"}
 
 MODEL_ID = os.getenv("LLM_MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct").strip()
 LLM_BACKEND = os.getenv("LLM_BACKEND", "local").strip().lower()

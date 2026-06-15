@@ -2,6 +2,7 @@ import json
 import urllib.error
 import urllib.request
 from functools import lru_cache
+from typing import Iterator
 
 import torch
 
@@ -179,6 +180,65 @@ def generate_with_yandex(
 
     _log_yandex_usage(usage_label, body)
     return _extract_yandex_output_text(body)
+
+
+def generate_with_yandex_stream(
+    messages: list[dict],
+    max_new_tokens: int,
+    prompt_id: str | None = None,
+) -> Iterator[str]:
+    """Стримит текст из Yandex Cloud LLM через SSE."""
+    if not YANDEX_API_KEY:
+        raise RuntimeError("YANDEX_API_KEY не задан.")
+    if not YANDEX_PROJECT_ID:
+        raise RuntimeError("YANDEX_PROJECT_ID не задан.")
+
+    from ..config import YANDEX_PROMPT_ID
+    effective_prompt_id = prompt_id if prompt_id is not None else YANDEX_PROMPT_ID
+
+    payload: dict = {
+        "input": _normalize_yandex_input(messages),
+        "temperature": 0,
+        "max_output_tokens": max_new_tokens,
+        "stream": True,
+    }
+    if effective_prompt_id:
+        payload["prompt"] = {"id": effective_prompt_id}
+    else:
+        payload["model"] = f"gpt://{YANDEX_PROJECT_ID}/{YANDEX_MODEL}"
+
+    request = urllib.request.Request(
+        f"{YANDEX_BASE_URL}/responses",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {YANDEX_API_KEY}",
+            "OpenAI-Project": YANDEX_PROJECT_ID,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=YANDEX_TIMEOUT) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8").rstrip("\r\n")
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:]  # убираем "data:" (без пробела — формат Yandex)
+                if data_str.strip() == "[DONE]":
+                    return
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("type") == "response.output_text.delta":
+                    delta = chunk.get("delta", "")
+                    if delta:
+                        yield delta
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Yandex Cloud stream HTTP {exc.code}: {detail}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Yandex Cloud stream failed: {exc}") from exc
 
 
 @lru_cache(maxsize=256)
