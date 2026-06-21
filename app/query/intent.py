@@ -3,7 +3,7 @@ import re
 
 from kb_aliases import apply_alias_map
 
-from ..config import LLM_BACKEND, SHORT_LLM_MAX_NEW_TOKENS, YANDEX_ROUTER_PROMPT_ID
+from ..config import LLM_BACKEND, ROUTER_MAX_NEW_TOKENS, YANDEX_ROUTER_PROMPT_ID
 from ..runtime import AUTO_QUERY_ALIASES
 from .llm import run_chat_generation
 
@@ -192,7 +192,12 @@ def is_off_topic(query: str) -> bool:
     personal = [
         "ты кто", "кто ты", "как тебя зовут",
         "привет", "здравствуй", "как дела",
-        "что ты", "ты робот", "ассистент", "помощник"
+        "что ты", "ты робот", "ассистент", "помощник",
+        "напиши реферат", "напиши доклад", "напиши сочинение", "напиши эссе",
+        "помоги написать", "помоги с рефератом", "помоги с докладом",
+        "составь реферат", "составь доклад", "сочини", "придумай",
+        "сделай за меня", "забудь систем", "забудь промт", "забудь промпт",
+        "забудь инструкц", "игнорируй систем", "игнорируй инструкц",
     ]
     if any(p in q for p in personal):
         return True
@@ -363,14 +368,22 @@ def _extract_json_object(text: str) -> dict | None:
         return None
 
 
-def classify_query_with_llm(query: str) -> dict | None:
+def classify_query_with_llm(
+    query: str,
+    history: list[dict] | None = None,
+    current_entity: str | None = None,
+) -> dict | None:
+    current_entity = (current_entity or "").strip()
+    content = f"[Текущая выбранная деталь сцены: {current_entity}]\n{query}" if current_entity else query
+
     if LLM_BACKEND == "yandex" and YANDEX_ROUTER_PROMPT_ID:
         messages = [
-            {"role": "user", "content": query},
+            *(history or [])[-6:],
+            {"role": "user", "content": content},
         ]
         raw = run_chat_generation(
             messages,
-            max_new_tokens=SHORT_LLM_MAX_NEW_TOKENS,
+            max_new_tokens=ROUTER_MAX_NEW_TOKENS,
             prompt_id=YANDEX_ROUTER_PROMPT_ID,
             usage_label="router",
         )
@@ -380,6 +393,7 @@ def classify_query_with_llm(query: str) -> dict | None:
 
         intent = (parsed.get("intent") or "").strip()
         meta_request = normalize_query((parsed.get("meta_request") or "").strip())
+        standalone_query = (parsed.get("standalone_query") or "").strip()
         if intent == "info":
             knowledge_text = (parsed.get("knowledge_text") or "").strip()
             route: dict = {"intent": "info"}
@@ -387,6 +401,8 @@ def classify_query_with_llm(query: str) -> dict | None:
                 route["knowledge_text"] = knowledge_text
             elif not meta_request:
                 route["knowledge_text"] = query
+            if standalone_query:
+                route["standalone_query"] = standalone_query
             if meta_request:
                 route["meta_request"] = meta_request
             return route
@@ -407,6 +423,8 @@ def classify_query_with_llm(query: str) -> dict | None:
         if intent == "hybrid":
             knowledge_text = (parsed.get("knowledge_text") or "").strip()
             route["knowledge_text"] = knowledge_text or ""
+            if standalone_query:
+                route["standalone_query"] = standalone_query
         if meta_request:
             route["meta_request"] = meta_request
         return route
@@ -476,12 +494,13 @@ def classify_query_with_llm(query: str) -> dict | None:
         {"role": "assistant", "content": '{"intent":"info","knowledge_text":"расскажи о Метеор-М"}'},
         {"role": "user", "content": "Сделай что-нибудь со спутником"},
         {"role": "assistant", "content": '{"intent":"unknown_command"}'},
-        {"role": "user", "content": query},
+        *(history or [])[-6:],
+        {"role": "user", "content": content},
     ]
 
     raw = run_chat_generation(
         messages,
-        max_new_tokens=SHORT_LLM_MAX_NEW_TOKENS,
+        max_new_tokens=ROUTER_MAX_NEW_TOKENS,
         prompt_id=YANDEX_ROUTER_PROMPT_ID,
         usage_label="router",
     )
@@ -492,6 +511,7 @@ def classify_query_with_llm(query: str) -> dict | None:
 
     intent = (parsed.get("intent") or "").strip()
     meta_request = normalize_query((parsed.get("meta_request") or "").strip())
+    standalone_query = (parsed.get("standalone_query") or "").strip()
     if intent == "info":
         knowledge_text = (parsed.get("knowledge_text") or "").strip()
         route = {"intent": "info"}
@@ -499,6 +519,8 @@ def classify_query_with_llm(query: str) -> dict | None:
             route["knowledge_text"] = knowledge_text
         elif not meta_request:
             route["knowledge_text"] = query
+        if standalone_query:
+            route["standalone_query"] = standalone_query
         if meta_request:
             route["meta_request"] = meta_request
         return route
@@ -519,6 +541,8 @@ def classify_query_with_llm(query: str) -> dict | None:
     if intent == "hybrid":
         knowledge_text = (parsed.get("knowledge_text") or "").strip()
         route["knowledge_text"] = knowledge_text or ""
+        if standalone_query:
+            route["standalone_query"] = standalone_query
     if meta_request:
         route["meta_request"] = meta_request
     return route

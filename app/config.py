@@ -35,6 +35,7 @@ LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "64"))
 LLM_MAX_INPUT_TOKENS = int(os.getenv("LLM_MAX_INPUT_TOKENS", "2048"))
 RAG_MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "1200"))
 SHORT_LLM_MAX_NEW_TOKENS = int(os.getenv("SHORT_LLM_MAX_NEW_TOKENS", "24"))
+ROUTER_MAX_NEW_TOKENS = int(os.getenv("ROUTER_MAX_NEW_TOKENS", "2000"))
 SHORT_RAG_MAX_CONTEXT_CHARS = int(os.getenv("SHORT_RAG_MAX_CONTEXT_CHARS", "250"))
 RELEVANCE_GATE_ENABLED = os.getenv("RELEVANCE_GATE_ENABLED", "0").strip().lower() not in {"0", "false", "no"}
 LLM_FORCE_SINGLE_GPU = os.getenv("LLM_FORCE_SINGLE_GPU", "1").strip().lower() not in {"0", "false", "no"}

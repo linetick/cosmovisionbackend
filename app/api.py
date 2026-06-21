@@ -56,6 +56,7 @@ class QueryRequest(BaseModel):
     text: str
     current_model_id: str | None = None
     current_spacecraft: str | None = None
+    current_entity_name: str | None = None
     stream: bool = False
     session_id: int | None = None
 
@@ -137,45 +138,6 @@ _ELABORATION_KEYWORDS = {
     "расширь", "продолжи", "продолжай", "объясни подробнее",
 }
 
-_FOLLOWUP_PRONOUNS = {
-    "он", "она", "оно", "они", "его", "её", "их", "ему", "ей", "им", "ими",
-    "него", "неё", "них", "этот", "эта", "это", "эти", "тот", "та", "те",
-    "такой", "такая", "такое", "такие",
-}
-
-_FOLLOWUP_STOPWORDS = {
-    "а", "и", "в", "на", "с", "к", "по", "из", "у", "за", "от", "для",
-    "что", "как", "где", "когда", "почему", "зачем", "сколько", "какой",
-    "какая", "какое", "какие", "расскажи", "объясни", "опиши", "про", "о",
-    "об", "расскажи", "объясни",
-    "тебя", "меня", "нас", "вас", "спрашивал", "спросил", "говорил",
-    "сказал", "сказала", "вопрос",
-}
-
-
-def _topic_words(text: str) -> list[str]:
-    tokens = re.findall(r"[а-яёa-z0-9-]+", text.lower())
-    return [w for w in tokens if w not in _FOLLOWUP_STOPWORDS and len(w) > 3]
-
-
-def _expand_followup_query(query: str, history: list[dict]) -> str:
-    q_tokens = set(re.findall(r"[а-яёa-z0-9-]+", query.lower()))
-    has_pronoun = bool(q_tokens & _FOLLOWUP_PRONOUNS)
-    has_elaboration_kw = any(kw in query.lower() for kw in _ELABORATION_KEYWORDS)
-    if not has_pronoun and not has_elaboration_kw and _topic_words(query):
-        return query
-
-    for m in reversed(history):
-        if m.get("role") != "user":
-            continue
-        topic_words = _topic_words(m["content"])
-        if topic_words:
-            extra = " ".join(topic_words[:3])
-            return f"{query} {extra}"
-
-    return query
-
-
 def resolve_current_spacecraft(
     current_model_id: str | None = None,
     current_spacecraft: str | None = None,
@@ -206,7 +168,11 @@ def resolve_scene(current_model_id: str | None = None) -> dict | None:
     return item.get("scene") or None
 
 
-def resolve_client_command(query: str) -> tuple[dict | None, dict]:
+def resolve_client_command(
+    query: str,
+    history: list[dict] | None = None,
+    current_entity: str | None = None,
+) -> tuple[dict | None, dict]:
     debug = {
         "normalized_query": query,
         "llm_route": None,
@@ -216,7 +182,7 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
         "resolution": "info",
     }
 
-    if not looks_like_client_command(query) and (looks_like_meta_request(query) or looks_like_knowledge_request(query)):
+    if not history and not current_entity and not looks_like_client_command(query) and (looks_like_meta_request(query) or looks_like_knowledge_request(query)):
         meta_request, knowledge_text = split_meta_and_knowledge_request(query)
         if meta_request or knowledge_text:
             debug["resolution"] = "fast_info_local"
@@ -229,7 +195,7 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
                 route["knowledge_text"] = query
             return route, debug
 
-    llm_route = classify_query_with_llm(query)
+    llm_route = classify_query_with_llm(query, history=history, current_entity=current_entity)
     if llm_route:
         debug["llm_route"] = llm_route
         if llm_route["intent"] == "action":
@@ -250,6 +216,7 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
                 "answer": COMMAND_ANSWERS[llm_route["command_type"]],
                 "knowledge_text": (llm_route.get("knowledge_text") or "").strip() or None,
                 "meta_request": (llm_route.get("meta_request") or "").strip() or None,
+                "standalone_query": (llm_route.get("standalone_query") or "").strip() or None,
             }
             if llm_route.get("entity_name"):
                 route["entity_name"] = llm_route["entity_name"]
@@ -290,10 +257,13 @@ def resolve_client_command(query: str) -> tuple[dict | None, dict]:
         route = {"intent": "info"}
         knowledge_text = (llm_route.get("knowledge_text") or "").strip()
         meta_request = (llm_route.get("meta_request") or "").strip()
+        standalone_query = (llm_route.get("standalone_query") or "").strip()
         if knowledge_text:
             route["knowledge_text"] = knowledge_text
         elif not meta_request:
             route["knowledge_text"] = query
+        if standalone_query:
+            route["standalone_query"] = standalone_query
         if meta_request:
             route["meta_request"] = meta_request
         return route, debug
@@ -340,8 +310,9 @@ def _handle_query_core(
     transcript: str | None = None,
     scene: dict | None = None,
     history: list[dict] | None = None,
+    current_entity: str | None = None,
 ) -> dict:
-    print(f"[QUERY] raw={q_raw!r}  spacecraft={spacecraft!r}  history_len={len(history or [])}")
+    print(f"[QUERY] raw={q_raw!r}  spacecraft={spacecraft!r}  history_len={len(history or [])}  current_entity={current_entity!r}")
     if spacecraft:
         q = inject_spacecraft_context(q, spacecraft)
 
@@ -351,7 +322,7 @@ def _handle_query_core(
             base_timing, {}, t_start, transcript,
         )
 
-    matched_command, _ = resolve_client_command(q)
+    matched_command, _ = resolve_client_command(q, history=history, current_entity=current_entity)
 
     if matched_command and matched_command["intent"] == "action":
         target_nodes = None
@@ -401,13 +372,23 @@ def _handle_query_core(
         }
         return _finalize(resp, base_timing, {"meta_generate": round(time.time() - t0, 3)}, t_start, transcript)
 
+    is_hybrid = bool(matched_command and matched_command["intent"] == "hybrid")
+
+    # Классификатор сам переписывает follow-up вопрос в самостоятельный
+    # (standalone_query), используя историю диалога. off_topic проверяем
+    # на переписанном запросе ДО подстановки названия аппарата, иначе
+    # любой вопрос пройдёт фильтр просто из-за упоминания "Спутник-1".
+    rag_query = knowledge_query
+    if matched_command:
+        standalone = (matched_command.get("standalone_query") or "").strip()
+        if standalone:
+            rag_query = normalize_query(standalone)
+
     t_topic0 = time.time()
-    # Если известна модель — пользователь явно в контексте КА, фильтр не нужен
-    off_topic = is_off_topic(knowledge_query) and not spacecraft
+    off_topic = is_off_topic(rag_query)
     topic_timing = {"topic_check": round(time.time() - t_topic0, 3)}
 
-    # В рамках активной сессии follow-up вопросы не блокируем
-    if off_topic and not (matched_command and matched_command["intent"] == "hybrid") and not history:
+    if off_topic and not is_hybrid:
         resp = {
             "query": q, "intent": "off_topic", "client_command": None,
             "answer": (
@@ -418,11 +399,8 @@ def _handle_query_core(
         }
         return _finalize(resp, base_timing, topic_timing, t_start, transcript)
 
-    is_hybrid = bool(matched_command and matched_command["intent"] == "hybrid")
-
-    # При follow-up вопросах (местоимения, короткий запрос) расширяем RAG-запрос
-    # темой из предыдущего сообщения пользователя
-    rag_query = _expand_followup_query(knowledge_query, history) if history else knowledge_query
+    if spacecraft:
+        rag_query = inject_spacecraft_context(rag_query, spacecraft)
 
     # Запросы на уточнение ("расскажи подробнее", "ещё") — отключаем компакт,
     # берём больше чанков, чтобы LLM было что развернуть
@@ -477,7 +455,7 @@ def _handle_query_core(
         )
 
     # Для follow-up/elaboration запросов используем расширенный запрос и для LLM
-    gen_query = rag_query if (history and rag_query != knowledge_query) else knowledge_query
+    gen_query = rag_query
 
     t_gen0 = time.time()
     mode = "compact" if (use_compact_generation() or is_hybrid) and not is_elaboration else "strict"
@@ -526,9 +504,16 @@ def _save_exchange(session_id: int, user_text: str, assistant_text: str, intent:
     db.commit()
 
 
-def _make_sse_stream(q: str, spacecraft: str | None, scene: dict | None, transcript: str | None = None, history: list[dict] | None = None):
+def _make_sse_stream(
+    q: str,
+    spacecraft: str | None,
+    scene: dict | None,
+    transcript: str | None = None,
+    history: list[dict] | None = None,
+    current_entity: str | None = None,
+):
     """Генератор SSE-событий для стримингового ответа."""
-    print(f"[STREAM][QUERY] raw={q!r}  spacecraft={spacecraft!r}  history_len={len(history or [])}")
+    print(f"[STREAM][QUERY] raw={q!r}  spacecraft={spacecraft!r}  history_len={len(history or [])}  current_entity={current_entity!r}")
 
     if not q:
         meta: dict = {"type": "meta", "intent": "info", "client_command": None}
@@ -540,7 +525,7 @@ def _make_sse_stream(q: str, spacecraft: str | None, scene: dict | None, transcr
         return
 
     qs = inject_spacecraft_context(q, spacecraft) if spacecraft else q
-    matched_command, _ = resolve_client_command(qs)
+    matched_command, _ = resolve_client_command(qs, history=history, current_entity=current_entity)
 
     intent = "info"
     client_cmd = None
@@ -595,16 +580,26 @@ def _make_sse_stream(q: str, spacecraft: str | None, scene: dict | None, transcr
             if knowledge_query and spacecraft:
                 knowledge_query = inject_spacecraft_context(knowledge_query, spacecraft)
 
-    # off_topic bypass когда известен КА
-    off_topic = is_off_topic(knowledge_query) and not spacecraft
-    if off_topic and not history:
+    # Классификатор сам переписывает follow-up вопрос в самостоятельный
+    # (standalone_query), используя историю диалога. off_topic проверяем
+    # на переписанном запросе ДО подстановки названия аппарата, иначе
+    # любой вопрос пройдёт фильтр просто из-за упоминания "Спутник-1".
+    rag_query = knowledge_query
+    if matched_command:
+        standalone = (matched_command.get("standalone_query") or "").strip()
+        if standalone:
+            rag_query = normalize_query(standalone)
+
+    off_topic = is_off_topic(rag_query)
+    if off_topic and intent != "hybrid":
         msg = "Я отвечаю только по космонавтике из базы знаний. Спроси, например: «Как устроены солнечные панели на Метеоре-М?»"
         yield f"data: {json.dumps({'type': 'token', 'text': msg}, ensure_ascii=False)}\n\n"
         yield "data: {\"type\":\"done\"}\n\n"
         return
 
-    # Расширение follow-up запросов и elaboration
-    rag_query = _expand_followup_query(knowledge_query, history) if history else knowledge_query
+    if spacecraft:
+        rag_query = inject_spacecraft_context(rag_query, spacecraft)
+
     is_elaboration = bool(history and any(kw in knowledge_query.lower() for kw in _ELABORATION_KEYWORDS))
 
     print(f"[STREAM][ROUTE] intent={intent}  knowledge_query={knowledge_query!r}  rag_query={rag_query!r}  is_elaboration={is_elaboration}  off_topic={off_topic}")
@@ -618,7 +613,7 @@ def _make_sse_stream(q: str, spacecraft: str | None, scene: dict | None, transcr
 
     print(f"[STREAM][RAG] docs={len(hits)}  context_len={len(context)}  context_preview={context[:120]!r}")
 
-    gen_query = rag_query if (history and rag_query != knowledge_query) else knowledge_query
+    gen_query = rag_query
 
     if not context:
         fallback = generate_answer_fallback(gen_query, meta_request=meta_request, history=history)
@@ -646,12 +641,13 @@ def handle_query(req: QueryRequest, user: User = Depends(get_current_user), db=D
 
     session_id = req.session_id if (req.session_id and user.id > 0) else None
     history = _load_history(session_id, user.id, db) if session_id else []
+    current_entity = (req.current_entity_name or "").strip() or None
 
     if req.stream:
         def stream_and_save():
             collected: list[str] = []
             final_intent: list[str] = ["info"]
-            for event in _make_sse_stream(q, spacecraft, scene, history=history):
+            for event in _make_sse_stream(q, spacecraft, scene, history=history, current_entity=current_entity):
                 yield event
                 if event.startswith("data:"):
                     try:
@@ -676,7 +672,7 @@ def handle_query(req: QueryRequest, user: User = Depends(get_current_user), db=D
     try:
         t0 = time.time()
         t1 = time.time()
-        result = _handle_query_core(raw, q, spacecraft, t0, {"normalize": round(t1 - t0, 3)}, scene=scene, history=history)
+        result = _handle_query_core(raw, q, spacecraft, t0, {"normalize": round(t1 - t0, 3)}, scene=scene, history=history, current_entity=current_entity)
         if session_id:
             _save_exchange(session_id, raw, result.get("answer", ""), result.get("intent", "info"), db)
         return result
@@ -737,6 +733,7 @@ async def handle_query_audio(
     file: UploadFile = File(...),
     current_model_id: str | None = Form(None),
     current_spacecraft: str | None = Form(None),
+    current_entity_name: str | None = Form(None),
     stream: bool = Form(False),
     session_id: int | None = Form(None),
     user: User = Depends(get_current_user),
@@ -774,12 +771,13 @@ async def handle_query_audio(
 
         sid = session_id if (session_id and user.id > 0) else None
         history = _load_history(sid, user.id, db) if sid else []
+        current_entity = (current_entity_name or "").strip() or None
 
         if stream:
             def stream_and_save():
                 collected: list[str] = []
                 final_intent: list[str] = ["info"]
-                for event in _make_sse_stream(q, spacecraft, scene, transcript=transcript, history=history):
+                for event in _make_sse_stream(q, spacecraft, scene, transcript=transcript, history=history, current_entity=current_entity):
                     yield event
                     if event.startswith("data:"):
                         try:
@@ -807,7 +805,7 @@ async def handle_query_audio(
             "transcribe": round(asr_stats["transcribe"], 3),
             "normalize": round(t2 - t1, 3),
         }
-        result = _handle_query_core(transcript, q, spacecraft, t0, base_timing, transcript=transcript, scene=scene, history=history)
+        result = _handle_query_core(transcript, q, spacecraft, t0, base_timing, transcript=transcript, scene=scene, history=history, current_entity=current_entity)
         if sid:
             _save_exchange(sid, transcript, result.get("answer", ""), result.get("intent", "info"), db)
         return result
