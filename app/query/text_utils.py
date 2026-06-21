@@ -133,6 +133,8 @@ def squeeze_to_one_sentence(text: str) -> str:
     if len(parts) >= 2 and len(parts[0].split()) <= 3 and len(parts[0]) <= 30:
         header = parts[0].rstrip(".!?")
         body = parts[1].rstrip()
+        if body.lower().startswith(header.lower()):
+            return body
         return f"{header}: {body}"
     return parts[0]
 
@@ -180,7 +182,9 @@ def split_doc_candidates(doc: str) -> list[str]:
 
     candidates: list[str] = []
     if len(lines) >= 2 and len(lines[0]) <= 40 and not re.search(r"[.!?]$", lines[0]):
-        candidates.append(f"{lines[0]}. {' '.join(lines[1:])}".strip())
+        body = " ".join(lines[1:])
+        if not body.lower().startswith(lines[0].lower()):
+            candidates.append(f"{lines[0]}. {body}".strip())
 
     candidates.extend(lines)
     merged_text = " ".join(lines)
@@ -224,6 +228,9 @@ def find_extractive_answer(query: str, hits: list[dict]) -> str | None:
         for candidate in split_doc_candidates(doc):
             candidate_tokens = set(tokenize_for_match(candidate))
             if not candidate_tokens:
+                continue
+            # Заголовки секций (< 5 слов без знаков препинания) не используем как ответ
+            if len(candidate.split()) < 5 and not re.search(r"[.!?—]", candidate):
                 continue
 
             total_overlap = len(query_tokens & candidate_tokens)

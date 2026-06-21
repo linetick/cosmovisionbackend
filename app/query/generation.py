@@ -71,9 +71,9 @@ def generate_answer_llm_only(query: str) -> str:
     return squeeze_to_one_sentence(text) if brief_answer else text
 
 
-def generate_answer_fallback(query: str, meta_request: str | None = None) -> str:
+def generate_answer_fallback(query: str, meta_request: str | None = None, history: list[dict] | None = None) -> str:
     meta_request = (meta_request or "").strip() or None
-    max_new_tokens = max(SHORT_LLM_MAX_NEW_TOKENS, 48)
+    max_new_tokens = LLM_MAX_NEW_TOKENS
 
     user_parts = [
         "РЕЖИМ FALLBACK.\nВ базе знаний по этому вопросу нет информации.",
@@ -81,30 +81,17 @@ def generate_answer_fallback(query: str, meta_request: str | None = None) -> str
     if meta_request:
         user_parts.append(f"ВОПРОС О СИСТЕМЕ:\n{meta_request}")
     user_parts.append(f"ВОПРОС О КОСМИЧЕСКОМ АППАРАТЕ:\n{query}")
-    user_parts.append(
-        "Кратко ответь по общим знаниям. "
-        "Если у тебя есть доступ к интернет-поиску или внешним инструментам, можешь использовать их. "
-        "Обязательно явно скажи, что в базе знаний нет информации, а в конце добавь: "
-        "«Ответ может быть неточным.» "
-        "Ответ должен быть коротким и понятным."
-    )
     user_content = "\n\n".join(user_parts)
 
     if LLM_BACKEND == "yandex" and YANDEX_PROMPT_ID:
-        messages = [
-            {"role": "user", "content": user_content},
-        ]
+        messages = [*(history or []), {"role": "user", "content": user_content}]
     else:
         system = (
             "Ты ИИ-ассистент по космонавтике.\n"
             "Если база знаний не дала ответа, разрешено кратко отвечать по общим знаниям.\n"
-            "Если у тебя есть доступ к внешним инструментам, можно их использовать.\n"
-            "Нужно явно сказать, что в базе знаний нет информации, и предупредить, что ответ может быть неточным."
+            "Обязательно предупреждай, что ответ основан на общих знаниях и может быть неточным."
         )
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_content},
-        ]
+        messages = [{"role": "system", "content": system}, *(history or []), {"role": "user", "content": user_content}]
 
     text = run_chat_generation(messages, max_new_tokens, usage_label="rag_fallback")
     text = re.sub(r"\s+", " ", text).strip()
@@ -125,12 +112,12 @@ def generate_answer_strict(
     meta_request = (meta_request or "").strip() or None
     multi_entity = is_multi_entity_query(query)
 
-    if not meta_request and not multi_entity and (is_definitional(query) or brief_answer):
+    if not history and not meta_request and not multi_entity and (is_definitional(query) or brief_answer):
         defin = extract_definition_from_context(query, context)
         if defin:
             return squeeze_to_one_sentence(defin) if brief_answer else defin
 
-    if not meta_request and not multi_entity:
+    if not history and not meta_request and not multi_entity:
         extractive = find_extractive_answer(query, hits or [])
         if extractive:
             return squeeze_to_one_sentence(extractive) if brief_answer else extractive
@@ -200,12 +187,12 @@ def generate_answer_compact(
     meta_request = (meta_request or "").strip() or None
     multi_entity = is_multi_entity_query(query)
 
-    if not meta_request and not multi_entity and is_definitional(query):
+    if not history and not meta_request and not multi_entity and is_definitional(query):
         defin = extract_definition_from_context(query, context)
         if defin:
             return squeeze_to_one_sentence(defin)
 
-    if not meta_request and not multi_entity:
+    if not history and not meta_request and not multi_entity:
         extractive = find_extractive_answer(query, hits or [])
         if extractive:
             return squeeze_to_one_sentence(extractive)
@@ -223,19 +210,27 @@ def generate_answer_compact(
         if not relevant:
             return REFUSAL
 
-    user_parts: list[str] = []
-    if meta_request:
-        user_parts.append(f"Система: {meta_request}")
-    user_parts.append(f"Контекст: {context}")
-    user_parts.append(f"Вопрос: {query}")
-    user_content = "\n".join(user_parts)
-    if multi_entity:
-        user_content += "\nЕсли упомянуто несколько аппаратов — ответь по каждому кратко."
-    user_content += "\nОтвет (одно предложение):"
-
     if LLM_BACKEND == "yandex" and YANDEX_PROMPT_ID:
+        user_parts: list[str] = []
+        if meta_request:
+            user_parts.append(f"ВОПРОС О СИСТЕМЕ:\n{meta_request}")
+        user_parts.append(f"КОНТЕКСТ:\n{context}")
+        user_parts.append(f"ВОПРОС О КОСМИЧЕСКОМ АППАРАТЕ:\n{query}")
+        user_content = "\n\n".join(user_parts)
+        if multi_entity:
+            user_content += "\n\nВ вопросе упомянуто несколько аппаратов. Ответь кратко по каждому."
         messages = [*(history or []), {"role": "user", "content": user_content}]
     else:
+        user_parts = []
+        if meta_request:
+            user_parts.append(f"Система: {meta_request}")
+        user_parts.append(f"Контекст: {context}")
+        user_parts.append(f"Вопрос: {query}")
+        user_content = "\n".join(user_parts)
+        if multi_entity:
+            user_content += "\nЕсли упомянуто несколько аппаратов — ответь по каждому кратко."
+        user_content += "\nОтвет (одно предложение):"
+
         system = (
             "Ты — ИИ-ассистент по космонавтике с RAG.\n"
             "Отвечай только по фрагментам базы знаний из блока КОНТЕКСТ.\n"
@@ -246,7 +241,8 @@ def generate_answer_compact(
         )
         messages = [{"role": "system", "content": system}, *(history or []), {"role": "user", "content": user_content}]
 
-    text = run_chat_generation(messages, SHORT_LLM_MAX_NEW_TOKENS, usage_label="rag_compact")
+    max_tokens = LLM_MAX_NEW_TOKENS if (LLM_BACKEND == "yandex" and YANDEX_PROMPT_ID) else SHORT_LLM_MAX_NEW_TOKENS
+    text = run_chat_generation(messages, max_tokens, usage_label="rag_compact")
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"^ответ:\s*", "", text, flags=re.IGNORECASE)
     if not text or len(text) < 3:

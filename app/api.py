@@ -1,6 +1,15 @@
 import json
+import logging
 import os
+import re
 import time
+
+log = logging.getLogger("cosmo")
+log.setLevel(logging.DEBUG)
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s [COSMO] %(message)s", "%H:%M:%S"))
+    log.addHandler(_h)
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -120,6 +129,51 @@ def generate_meta_answer(meta_request: str) -> str:
     return generate_answer_llm_only(
         f"{meta_request}\n\nОтветь одним коротким предложением про ассистента, приложение или текущий режим работы."
     )
+
+
+_ELABORATION_KEYWORDS = {
+    "подробнее", "подробно", "подробней", "детально", "детальнее",
+    "больше", "ещё", "еще", "ещё раз", "еще раз", "поподробнее",
+    "расширь", "продолжи", "продолжай", "объясни подробнее",
+}
+
+_FOLLOWUP_PRONOUNS = {
+    "он", "она", "оно", "они", "его", "её", "их", "ему", "ей", "им", "ими",
+    "него", "неё", "них", "этот", "эта", "это", "эти", "тот", "та", "те",
+    "такой", "такая", "такое", "такие",
+}
+
+_FOLLOWUP_STOPWORDS = {
+    "а", "и", "в", "на", "с", "к", "по", "из", "у", "за", "от", "для",
+    "что", "как", "где", "когда", "почему", "зачем", "сколько", "какой",
+    "какая", "какое", "какие", "расскажи", "объясни", "опиши", "про", "о",
+    "об", "расскажи", "объясни",
+    "тебя", "меня", "нас", "вас", "спрашивал", "спросил", "говорил",
+    "сказал", "сказала", "вопрос",
+}
+
+
+def _topic_words(text: str) -> list[str]:
+    tokens = re.findall(r"[а-яёa-z0-9-]+", text.lower())
+    return [w for w in tokens if w not in _FOLLOWUP_STOPWORDS and len(w) > 3]
+
+
+def _expand_followup_query(query: str, history: list[dict]) -> str:
+    q_tokens = set(re.findall(r"[а-яёa-z0-9-]+", query.lower()))
+    has_pronoun = bool(q_tokens & _FOLLOWUP_PRONOUNS)
+    has_elaboration_kw = any(kw in query.lower() for kw in _ELABORATION_KEYWORDS)
+    if not has_pronoun and not has_elaboration_kw and _topic_words(query):
+        return query
+
+    for m in reversed(history):
+        if m.get("role") != "user":
+            continue
+        topic_words = _topic_words(m["content"])
+        if topic_words:
+            extra = " ".join(topic_words[:3])
+            return f"{query} {extra}"
+
+    return query
 
 
 def resolve_current_spacecraft(
@@ -287,6 +341,7 @@ def _handle_query_core(
     scene: dict | None = None,
     history: list[dict] | None = None,
 ) -> dict:
+    print(f"[QUERY] raw={q_raw!r}  spacecraft={spacecraft!r}  history_len={len(history or [])}")
     if spacecraft:
         q = inject_spacecraft_context(q, spacecraft)
 
@@ -347,7 +402,8 @@ def _handle_query_core(
         return _finalize(resp, base_timing, {"meta_generate": round(time.time() - t0, 3)}, t_start, transcript)
 
     t_topic0 = time.time()
-    off_topic = is_off_topic(knowledge_query)
+    # Если известна модель — пользователь явно в контексте КА, фильтр не нужен
+    off_topic = is_off_topic(knowledge_query) and not spacecraft
     topic_timing = {"topic_check": round(time.time() - t_topic0, 3)}
 
     # В рамках активной сессии follow-up вопросы не блокируем
@@ -364,9 +420,21 @@ def _handle_query_core(
 
     is_hybrid = bool(matched_command and matched_command["intent"] == "hybrid")
 
+    # При follow-up вопросах (местоимения, короткий запрос) расширяем RAG-запрос
+    # темой из предыдущего сообщения пользователя
+    rag_query = _expand_followup_query(knowledge_query, history) if history else knowledge_query
+
+    # Запросы на уточнение ("расскажи подробнее", "ещё") — отключаем компакт,
+    # берём больше чанков, чтобы LLM было что развернуть
+    is_elaboration = bool(
+        history and any(kw in knowledge_query.lower() for kw in _ELABORATION_KEYWORDS)
+    )
+
+    print(f"[ROUTE] intent={matched_command['intent'] if matched_command else 'info'}  knowledge_query={knowledge_query!r}  rag_query={rag_query!r}  is_elaboration={is_elaboration}  off_topic={off_topic}")
+
     t_retr0 = time.time()
-    compact = use_compact_generation() or is_hybrid
-    context, hits, rs = retrieve_context(knowledge_query, initial_n=1 if compact else 3, max_n=3 if compact else 9)
+    compact = (use_compact_generation() or is_hybrid) and not is_elaboration
+    context, hits, rs = retrieve_context(rag_query, initial_n=1 if compact else 3, max_n=3 if compact else 9)
     retr_timing = {
         "retrieve": round(time.time() - t_retr0, 3),
         "retrieve_embed": round(rs["embed"], 3),
@@ -374,6 +442,7 @@ def _handle_query_core(
         "retrieve_postprocess": round(rs["postprocess"], 3),
         "retrieve_context_build": round(rs["context_build"], 3),
     }
+    print(f"[RAG] docs={len(hits)}  context_len={len(context)}  context_preview={context[:120]!r}")
 
     def _result(answer: str, context_used: bool, extra: dict | None = None) -> dict:
         if is_hybrid:
@@ -400,23 +469,30 @@ def _handle_query_core(
 
     if not context:
         t_fb0 = time.time()
-        fallback_answer = generate_answer_fallback(knowledge_query, meta_request=meta_request)
+        fallback_answer = generate_answer_fallback(knowledge_query, meta_request=meta_request, history=history)
         fb_timing = {"fallback_generate": round(time.time() - t_fb0, 3)}
         return _finalize(
             _result(fallback_answer, False, {"fallback_used": True}),
             base_timing, {**topic_timing, **retr_timing, **fb_timing}, t_start, transcript,
         )
 
+    # Для follow-up/elaboration запросов используем расширенный запрос и для LLM
+    gen_query = rag_query if (history and rag_query != knowledge_query) else knowledge_query
+
     t_gen0 = time.time()
-    if use_compact_generation() or is_hybrid:
-        answer = generate_answer_compact(knowledge_query, context, hits, meta_request=meta_request, history=history)
+    mode = "compact" if (use_compact_generation() or is_hybrid) and not is_elaboration else "strict"
+    print(f"[GEN] mode={mode}  gen_query={gen_query!r}")
+    if mode == "compact":
+        answer = generate_answer_compact(gen_query, context, hits, meta_request=meta_request, history=history)
     else:
-        answer = generate_answer_strict(knowledge_query, context, hits, meta_request=meta_request, history=history)
+        answer = generate_answer_strict(gen_query, context, hits, meta_request=meta_request, history=history)
+    print(f"[GEN] answer={answer[:200]!r}")
     gen_timing = {"generate": round(time.time() - t_gen0, 3)}
 
     if answer == REFUSAL:
+        print("[GEN] REFUSAL → fallback")
         t_fb0 = time.time()
-        fallback_answer = generate_answer_fallback(knowledge_query, meta_request=meta_request)
+        fallback_answer = generate_answer_fallback(gen_query, meta_request=meta_request, history=history)
         fb_timing = {"fallback_generate": round(time.time() - t_fb0, 3)}
         return _finalize(
             _result(fallback_answer, False, {"fallback_used": True}),
@@ -452,6 +528,17 @@ def _save_exchange(session_id: int, user_text: str, assistant_text: str, intent:
 
 def _make_sse_stream(q: str, spacecraft: str | None, scene: dict | None, transcript: str | None = None, history: list[dict] | None = None):
     """Генератор SSE-событий для стримингового ответа."""
+    print(f"[STREAM][QUERY] raw={q!r}  spacecraft={spacecraft!r}  history_len={len(history or [])}")
+
+    if not q:
+        meta: dict = {"type": "meta", "intent": "info", "client_command": None}
+        if transcript is not None:
+            meta["transcript"] = transcript
+        yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'token', 'text': REFUSAL}, ensure_ascii=False)}\n\n"
+        yield "data: {\"type\":\"done\"}\n\n"
+        return
+
     qs = inject_spacecraft_context(q, spacecraft) if spacecraft else q
     matched_command, _ = resolve_client_command(qs)
 
@@ -508,18 +595,40 @@ def _make_sse_stream(q: str, spacecraft: str | None, scene: dict | None, transcr
             if knowledge_query and spacecraft:
                 knowledge_query = inject_spacecraft_context(knowledge_query, spacecraft)
 
+    # off_topic bypass когда известен КА
+    off_topic = is_off_topic(knowledge_query) and not spacecraft
+    if off_topic and not history:
+        msg = "Я отвечаю только по космонавтике из базы знаний. Спроси, например: «Как устроены солнечные панели на Метеоре-М?»"
+        yield f"data: {json.dumps({'type': 'token', 'text': msg}, ensure_ascii=False)}\n\n"
+        yield "data: {\"type\":\"done\"}\n\n"
+        return
+
+    # Расширение follow-up запросов и elaboration
+    rag_query = _expand_followup_query(knowledge_query, history) if history else knowledge_query
+    is_elaboration = bool(history and any(kw in knowledge_query.lower() for kw in _ELABORATION_KEYWORDS))
+
+    print(f"[STREAM][ROUTE] intent={intent}  knowledge_query={knowledge_query!r}  rag_query={rag_query!r}  is_elaboration={is_elaboration}  off_topic={off_topic}")
+
     if intent == "hybrid" and matched_command:
         yield f"data: {json.dumps({'type': 'token', 'text': matched_command['answer'] + ' '}, ensure_ascii=False)}\n\n"
 
-    context, hits, _ = retrieve_context(knowledge_query, initial_n=1, max_n=3)
+    initial_n = 1 if not is_elaboration else 3
+    max_n = 3 if not is_elaboration else 9
+    context, hits, _ = retrieve_context(rag_query, initial_n=initial_n, max_n=max_n)
+
+    print(f"[STREAM][RAG] docs={len(hits)}  context_len={len(context)}  context_preview={context[:120]!r}")
+
+    gen_query = rag_query if (history and rag_query != knowledge_query) else knowledge_query
 
     if not context:
-        fallback = generate_answer_fallback(knowledge_query, meta_request=meta_request)
+        fallback = generate_answer_fallback(gen_query, meta_request=meta_request, history=history)
+        print(f"[STREAM][GEN] no context → fallback={fallback[:100]!r}")
         yield f"data: {json.dumps({'type': 'token', 'text': fallback}, ensure_ascii=False)}\n\n"
         yield "data: {\"type\":\"done\"}\n\n"
         return
 
-    for chunk in generate_answer_stream(knowledge_query, context, meta_request=meta_request, history=history):
+    print(f"[STREAM][GEN] streaming gen_query={gen_query!r}")
+    for chunk in generate_answer_stream(gen_query, context, meta_request=meta_request, history=history):
         yield f"data: {json.dumps({'type': 'token', 'text': chunk}, ensure_ascii=False)}\n\n"
 
     yield "data: {\"type\":\"done\"}\n\n"
@@ -880,11 +989,11 @@ def create_session(
 ):
     if user.id == 0:
         raise HTTPException(status_code=401, detail="Требуется авторизация")
-    sess = DBSession(user_id=user.id, spacecraft_id=current_model_id)
+    sess = DBSession(user_id=user.id)
     db.add(sess)
     db.commit()
     db.refresh(sess)
-    return {"id": sess.id, "spacecraft_id": sess.spacecraft_id, "created_at": sess.created_at}
+    return {"id": sess.id, "current_model_id": current_model_id, "created_at": sess.created_at}
 
 
 @app.get("/sessions")
