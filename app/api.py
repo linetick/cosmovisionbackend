@@ -33,7 +33,6 @@ from .query import (
     has_sufficient_context_relevance,
     infer_client_command_from_markers,
     inject_spacecraft_context,
-    is_off_topic,
     looks_like_knowledge_request,
     looks_like_client_command,
     looks_like_meta_request,
@@ -374,30 +373,13 @@ def _handle_query_core(
 
     is_hybrid = bool(matched_command and matched_command["intent"] == "hybrid")
 
-    # Классификатор сам переписывает follow-up вопрос в самостоятельный
-    # (standalone_query), используя историю диалога. off_topic проверяем
-    # на переписанном запросе ДО подстановки названия аппарата, иначе
-    # любой вопрос пройдёт фильтр просто из-за упоминания "Спутник-1".
     rag_query = knowledge_query
     if matched_command:
         standalone = (matched_command.get("standalone_query") or "").strip()
         if standalone:
             rag_query = normalize_query(standalone)
 
-    t_topic0 = time.time()
-    off_topic = is_off_topic(rag_query)
-    topic_timing = {"topic_check": round(time.time() - t_topic0, 3)}
-
-    if off_topic and not is_hybrid:
-        resp = {
-            "query": q, "intent": "off_topic", "client_command": None,
-            "answer": (
-                "Я отвечаю только по космонавтике из базы знаний. "
-                "Спроси, например: «Как устроены солнечные панели на Метеоре-М?»"
-            ),
-            "context_used": False,
-        }
-        return _finalize(resp, base_timing, topic_timing, t_start, transcript)
+    topic_timing = {"topic_check": 0}
 
     if spacecraft:
         rag_query = inject_spacecraft_context(rag_query, spacecraft)
@@ -408,7 +390,7 @@ def _handle_query_core(
         history and any(kw in knowledge_query.lower() for kw in _ELABORATION_KEYWORDS)
     )
 
-    print(f"[ROUTE] intent={matched_command['intent'] if matched_command else 'info'}  knowledge_query={knowledge_query!r}  rag_query={rag_query!r}  is_elaboration={is_elaboration}  off_topic={off_topic}")
+    print(f"[ROUTE] intent={matched_command['intent'] if matched_command else 'info'}  knowledge_query={knowledge_query!r}  rag_query={rag_query!r}  is_elaboration={is_elaboration}")
 
     t_retr0 = time.time()
     compact = (use_compact_generation() or is_hybrid) and not is_elaboration
@@ -526,6 +508,10 @@ def _make_sse_stream(
 
     qs = inject_spacecraft_context(q, spacecraft) if spacecraft else q
     matched_command, _ = resolve_client_command(qs, history=history, current_entity=current_entity)
+    _mc_intent = matched_command.get("intent") if matched_command else None
+    _mc_standalone = repr(matched_command.get("standalone_query")) if matched_command else "None"
+    _mc_knowledge = repr(matched_command.get("knowledge_text")) if matched_command else "None"
+    print(f"[STREAM][CLASSIFY] matched={matched_command is not None}  intent={_mc_intent}  standalone={_mc_standalone}  knowledge_text={_mc_knowledge}")
 
     intent = "info"
     client_cmd = None
@@ -580,29 +566,18 @@ def _make_sse_stream(
             if knowledge_query and spacecraft:
                 knowledge_query = inject_spacecraft_context(knowledge_query, spacecraft)
 
-    # Классификатор сам переписывает follow-up вопрос в самостоятельный
-    # (standalone_query), используя историю диалога. off_topic проверяем
-    # на переписанном запросе ДО подстановки названия аппарата, иначе
-    # любой вопрос пройдёт фильтр просто из-за упоминания "Спутник-1".
     rag_query = knowledge_query
     if matched_command:
         standalone = (matched_command.get("standalone_query") or "").strip()
         if standalone:
             rag_query = normalize_query(standalone)
 
-    off_topic = is_off_topic(rag_query)
-    if off_topic and intent != "hybrid":
-        msg = "Я отвечаю только по космонавтике из базы знаний. Спроси, например: «Как устроены солнечные панели на Метеоре-М?»"
-        yield f"data: {json.dumps({'type': 'token', 'text': msg}, ensure_ascii=False)}\n\n"
-        yield "data: {\"type\":\"done\"}\n\n"
-        return
-
     if spacecraft:
         rag_query = inject_spacecraft_context(rag_query, spacecraft)
 
     is_elaboration = bool(history and any(kw in knowledge_query.lower() for kw in _ELABORATION_KEYWORDS))
 
-    print(f"[STREAM][ROUTE] intent={intent}  knowledge_query={knowledge_query!r}  rag_query={rag_query!r}  is_elaboration={is_elaboration}  off_topic={off_topic}")
+    print(f"[STREAM][ROUTE] intent={intent}  knowledge_query={knowledge_query!r}  rag_query={rag_query!r}  is_elaboration={is_elaboration}")
 
     if intent == "hybrid" and matched_command:
         yield f"data: {json.dumps({'type': 'token', 'text': matched_command['answer'] + ' '}, ensure_ascii=False)}\n\n"

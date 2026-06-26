@@ -1,0 +1,12 @@
+email:    test@test.com
+password: test123
+user_id:  6
+
+# Токен действует до 2099 года — использовать для curl/тестирования
+TOKEN=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI2IiwidHlwZSI6ImFjY2VzcyIsImV4cCI6NDA3MDkwODgwMH0.Qn4HxzHqEufSfjRyIoswNomzoK2N8YXbhj3Av80baHo
+
+# Пример curl:
+# curl -s -X POST http://localhost:8000/query \
+#   -H "Content-Type: application/json" \
+#   -H "Authorization: Bearer $TOKEN" \
+#   -d '{"text": "...", "current_entity_name": "...", "stream": false}'
