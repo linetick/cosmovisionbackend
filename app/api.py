@@ -788,6 +788,23 @@ async def handle_query_audio(
         raise HTTPException(status_code=500, detail=f"Ошибка обработки аудио: {str(exc)}")
 
 
+@app.post("/transcribe")
+async def handle_transcribe(
+    file: UploadFile = File(...),
+    _: User = Depends(get_current_user),
+):
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Пустой аудиофайл")
+    try:
+        transcript, _ = await run_in_threadpool(
+            transcribe_audio_bytes_detailed, audio_bytes, language="ru"
+        )
+        return {"transcript": transcript}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Ошибка распознавания речи: {str(exc)}")
+
+
 @app.get("/models")
 def get_models():
     items = list_models()
